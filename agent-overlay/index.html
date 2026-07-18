@@ -12,17 +12,42 @@
       <header id="titlebar" data-tauri-drag-region>
         <span class="logo" data-tauri-drag-region>⌬ AGENT OVERLAY</span>
         <span id="status-badge" class="badge hidden">0 running · 0 idle</span>
+        <span class="spacer" data-tauri-drag-region></span>
         <span class="hint" data-tauri-drag-region>Ctrl+Shift+Space to toggle</span>
         <button id="btn-refresh" title="Refresh sessions">⟳</button>
         <button id="btn-launch" title="Launch a new agent session">＋</button>
         <button id="btn-hide" title="Hide overlay">─</button>
       </header>
 
-      <section id="sessions" class="grid"></section>
+      <div id="board">
+        <div class="column" id="col-running">
+          <div class="col-header running">
+            <span class="col-dot">●</span> Running
+            <span class="col-count" id="count-running">0</span>
+          </div>
+          <div class="col-cards" id="cards-running"></div>
+        </div>
+        <div class="col-divider"></div>
+        <div class="column" id="col-idle">
+          <div class="col-header idle">
+            <span class="col-dot">○</span> Idle
+            <span class="col-count" id="count-idle">0</span>
+          </div>
+          <div class="col-cards" id="cards-idle"></div>
+        </div>
+        <div class="col-divider"></div>
+        <div class="column" id="col-error">
+          <div class="col-header error">
+            <span class="col-dot">✕</span> Error
+            <span class="col-count" id="count-error">0</span>
+          </div>
+          <div class="col-cards" id="cards-error"></div>
+        </div>
+      </div>
 
       <div id="empty" class="hidden">
         <p>No agent sessions found.</p>
-        <p class="hint">Start <code>claude</code>, <code>codex</code>, <code>gemini</code>… in any terminal and they appear here.</p>
+        <p class="hint">Start <code>claude</code>, <code>codex</code>, <code>gemini</code>… in any terminal.</p>
       </div>
 
       <dialog id="launch-dialog">

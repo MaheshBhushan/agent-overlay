@@ -13,20 +13,14 @@ interface AgentSession {
   tail: string[];
 }
 
-const STATUS_ICON: Record<string, string> = {
-  running: "●",
-  idle: "○",
-  error: "✕",
-};
-
 const AGENT_BADGE: Record<string, string> = {
-  claude: "CC",
-  codex: "CX",
-  gemini: "GM",
-  opencode: "OC",
-  aider: "AI",
-  goose: "GS",
-  pi: "PI",
+  claude:    "CC",
+  codex:     "CX",
+  gemini:    "GM",
+  opencode:  "OC",
+  aider:     "AI",
+  goose:     "GS",
+  pi:        "PI",
 };
 
 let sessions: AgentSession[] = [];
@@ -45,49 +39,60 @@ function projectName(cwd: string): string {
 }
 
 function fmtDuration(secs: number): string {
-  if (secs < 60) return `${secs}s`;
+  if (secs < 60)   return `${secs}s`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
   return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }
 
-function statusLabel(s: AgentSession): string {
-  if (s.status === "running") return "running";
-  const dur = s.idle_secs != null ? ` ${fmtDuration(s.idle_secs)}` : "";
-  return `${s.status}${dur}`;
+function cardHtml(s: AgentSession): string {
+  const inTmux = !s.pane_id.startsWith("pid:");
+  const srcTag = inTmux
+    ? ""
+    : `<span class="term-tag" title="Plain terminal (not tmux)">term</span>`;
+  const badge = AGENT_BADGE[s.agent] ?? s.agent.slice(0, 2).toUpperCase();
+  const idleTag = s.idle_secs != null
+    ? `<span class="card-idle">${fmtDuration(s.idle_secs)}</span>`
+    : "";
+  const tailText = s.tail.slice(-2).join("\n").trim();
+
+  return `<div class="card" data-pane="${esc(s.pane_id)}" title="Double-click to open terminal">
+    <div class="card-head">
+      <span class="agent-badge">${esc(badge)}</span>
+      <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
+      ${srcTag}
+      <button class="kill" data-pane="${esc(s.pane_id)}" title="Kill session">✕</button>
+    </div>
+    <div class="card-meta">
+      <span class="card-path" title="${esc(s.cwd)}">${esc(s.cwd)}</span>
+      ${idleTag}
+    </div>
+    ${tailText ? `<div class="card-tail">${esc(tailText)}</div>` : ""}
+  </div>`;
 }
 
 function render() {
-  const grid = $("#sessions");
-  const badge = $("#status-badge");
-  const empty = $("#empty");
+  const badge      = $("#status-badge");
+  const empty      = $("#empty");
+  const board      = $("#board");
+
+  const running = sessions.filter(s => s.status === "running");
+  const idle    = sessions.filter(s => s.status === "idle");
+  const errors  = sessions.filter(s => s.status === "error");
 
   empty.classList.toggle("hidden", sessions.length > 0);
+  board.classList.toggle("hidden", sessions.length === 0);
 
-  grid.innerHTML = sessions
-    .map((s) => {
-      const icon = STATUS_ICON[s.status] ?? "○";
-      const inTmux = !s.pane_id.startsWith("pid:");
-      const srcTag = inTmux
-        ? ""
-        : `<span class="term-tag" title="Running in a plain terminal (not tmux)">term</span>`;
-      return `<div class="card status-${esc(s.status)}" data-pane="${esc(s.pane_id)}" title="Double-click to open this session's terminal">
-        <div class="card-head">
-          <span class="agent-badge">${esc(AGENT_BADGE[s.agent] ?? s.agent.slice(0, 2).toUpperCase())}</span>
-          <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
-          ${srcTag}
-          <button class="kill" data-pane="${esc(s.pane_id)}" title="Kill session">✕</button>
-        </div>
-        <div class="card-status"><span class="dot">${icon}</span> ${esc(statusLabel(s))}</div>
-        <div class="card-tail">${esc(s.tail.slice(-2).join("\n"))}</div>
-      </div>`;
-    })
-    .join("");
+  $("#cards-running").innerHTML = running.map(cardHtml).join("");
+  $("#cards-idle").innerHTML    = idle.map(cardHtml).join("");
+  $("#cards-error").innerHTML   = errors.map(cardHtml).join("");
 
-  const running = sessions.filter((s) => s.status === "running").length;
-  const idle = sessions.filter((s) => s.status !== "running").length;
-  badge.textContent = `${running} running · ${idle} idle`;
+  $("#count-running").textContent = String(running.length);
+  $("#count-idle").textContent    = String(idle.length);
+  $("#count-error").textContent   = String(errors.length);
+
+  badge.textContent = `${running.length} running · ${idle.length} idle`;
   badge.classList.toggle("hidden", sessions.length === 0);
-  badge.classList.toggle("all-idle", running === 0 && idle > 0);
+  badge.classList.toggle("all-idle", running.length === 0 && idle.length > 0);
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -97,6 +102,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     sessions = event.payload;
     render();
   });
+
   sessions = await invoke<AgentSession[]>("get_sessions");
   render();
 
@@ -109,7 +115,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
-  // Double-click a session card → raise its terminal window.
   document.body.addEventListener("dblclick", (e) => {
     const card = (e.target as HTMLElement).closest(".card") as HTMLElement | null;
     if (!card?.dataset.pane || (e.target as HTMLElement).classList.contains("kill")) return;
@@ -131,7 +136,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     const submitter = (e as SubmitEvent).submitter as HTMLButtonElement | null;
     if (submitter?.value !== "ok") return;
     const agent = ($("#launch-agent") as HTMLSelectElement).value;
-    const cwd = ($("#launch-cwd") as HTMLInputElement).value || "~";
+    const cwd   = ($("#launch-cwd") as HTMLInputElement).value || "~";
     invoke("launch_session", { agent, cwd }).catch((err) =>
       alert(`Launch failed: ${err}`)
     );
