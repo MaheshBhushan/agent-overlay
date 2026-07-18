@@ -32,6 +32,8 @@ const AGENTS: &[(&str, &str)] = &[
     ("opencode", "opencode"),
     ("aider", "aider"),
     ("goose", "goose"),
+    ("pi", "pi"),
+    ("pycli", "pi"),
 ];
 
 /// Output stability window: if a pane's content changed within this many
@@ -61,7 +63,11 @@ fn tmux(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Map of pid -> (ppid, argv) for the whole system, one `ps` call.
+/// Map of pid -> (ppid, argv) for the whole system.
+///
+/// Linux: one `ps` call reading /proc via the ps binary.
+/// Windows: the sysinfo-backed table (ps is unavailable).
+#[cfg(not(windows))]
 pub fn process_table() -> HashMap<u32, (u32, String)> {
     let mut table = HashMap::new();
     let Some(out) = Command::new("ps")
@@ -85,14 +91,36 @@ pub fn process_table() -> HashMap<u32, (u32, String)> {
     table
 }
 
+#[cfg(windows)]
+pub fn process_table() -> HashMap<u32, (u32, String)> {
+    crate::procscan::process_table_sysinfo()
+}
+
+/// Strip a leading path (either `/` or `\` separated) and any Windows
+/// executable/script suffix so tokens like `C:\bin\claude.cmd`, `claude.exe`
+/// or `/usr/bin/claude` all reduce to the bare command name for matching.
+fn normalize_token(tok: &str) -> &str {
+    let base = tok
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(tok);
+    for suffix in [".exe", ".cmd", ".ps1", ".bat"] {
+        if let Some(stripped) = base.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    base
+}
+
 /// Match an argv string against the known agent CLIs
-/// ("claude", "/usr/bin/claude", "node .../claude" etc.).
+/// ("claude", "/usr/bin/claude", "node .../claude", "claude.cmd",
+/// "C:\\...\\claude.exe" etc.).
 pub fn agent_from_args(args: &str) -> Option<String> {
     let lower = args.to_lowercase();
     for (name, label) in AGENTS {
         if lower
             .split_whitespace()
-            .any(|tok| tok == *name || tok.ends_with(&format!("/{name}")))
+            .any(|tok| normalize_token(tok) == *name)
         {
             return Some(label.to_string());
         }

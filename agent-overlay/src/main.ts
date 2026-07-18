@@ -26,6 +26,7 @@ const AGENT_BADGE: Record<string, string> = {
   opencode: "OC",
   aider: "AI",
   goose: "GS",
+  pi: "PI",
 };
 
 let sessions: AgentSession[] = [];

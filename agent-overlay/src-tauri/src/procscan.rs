@@ -31,6 +31,96 @@ struct ProcActivity {
 
 static ACTIVITY: Mutex<Option<HashMap<u32, ProcActivity>>> = Mutex::new(None);
 
+// --- Windows process/CPU backend (sysinfo) --------------------------------
+//
+// On Linux we read /proc directly (see the cfg(not(windows)) helpers below);
+// the numbers there are CPU "jiffies" where one jiffy is 10ms of CPU time, so
+// ACTIVE_JIFFIES (8) is ~80ms of CPU per ~1s poll. On Windows sysinfo reports
+// accumulated CPU time in milliseconds, which we convert to the same
+// jiffy unit (ms / 10) so all the streak/threshold semantics carry over
+// unchanged.
+#[cfg(windows)]
+mod win {
+    use std::sync::Mutex;
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+    /// Shared System kept across polls so CPU accumulation is meaningful and
+    /// process CPU deltas line up with our per-poll cadence.
+    static SYSTEM: Mutex<Option<System>> = Mutex::new(None);
+
+    /// Refresh the shared System's process list (pid, parent, cmd, cwd, cpu).
+    fn with_system<R>(f: impl FnOnce(&System) -> R) -> R {
+        let mut guard = SYSTEM.lock().unwrap();
+        let sys = guard.get_or_insert_with(System::new);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_cmd(sysinfo::UpdateKind::Always)
+                .with_cwd(sysinfo::UpdateKind::Always),
+        );
+        f(sys)
+    }
+
+    /// pid -> (ppid, joined command line), matching the Linux `ps` table shape.
+    pub fn process_table() -> std::collections::HashMap<u32, (u32, String)> {
+        with_system(|sys| {
+            let mut table = std::collections::HashMap::new();
+            for (pid, proc_) in sys.processes() {
+                let ppid = proc_.parent().map(|p| p.as_u32()).unwrap_or(0);
+                let cmd: String = if proc_.cmd().is_empty() {
+                    proc_
+                        .exe()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                } else {
+                    proc_
+                        .cmd()
+                        .iter()
+                        .map(|s| s.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                table.insert(pid.as_u32(), (ppid, cmd));
+            }
+            table
+        })
+    }
+
+    /// Accumulated CPU time for a pid, expressed in 10ms "jiffies" so the
+    /// same ACTIVE_JIFFIES threshold used on Linux applies unchanged.
+    pub fn cpu_jiffies(pid: u32) -> Option<u64> {
+        with_system(|sys| {
+            sys.process(sysinfo::Pid::from_u32(pid))
+                .map(|p| p.accumulated_cpu_time() / 10)
+        })
+    }
+
+    pub fn cwd(pid: u32) -> String {
+        with_system(|sys| {
+            sys.process(sysinfo::Pid::from_u32(pid))
+                .and_then(|p| p.cwd())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "?".to_string())
+        })
+    }
+
+    pub fn kill(pid: u32) -> bool {
+        with_system(|sys| {
+            sys.process(sysinfo::Pid::from_u32(pid))
+                .map(|p| p.kill())
+                .unwrap_or(false)
+        })
+    }
+}
+
+/// Windows: expose the sysinfo process table to tmux.rs's process_table().
+#[cfg(windows)]
+pub fn process_table_sysinfo() -> HashMap<u32, (u32, String)> {
+    win::process_table()
+}
+
 /// All descendants (inclusive) of the given root pids.
 fn descendants(roots: &[u32], table: &HashMap<u32, (u32, String)>) -> HashSet<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -95,9 +185,7 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
 
     for pid in &tops {
         let agent = matched[pid].clone();
-        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "?".to_string());
+        let cwd = read_cwd(*pid);
 
         let cpu = read_cpu_jiffies(*pid).unwrap_or(0);
         let entry = activity.entry(*pid).or_insert(ProcActivity {
@@ -143,8 +231,23 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
     sessions
 }
 
-/// utime + stime from /proc/<pid>/stat. The comm field can contain spaces and
-/// parens, so split on the *last* ')' before indexing fields.
+/// Working directory of a process, or "?" if unavailable.
+#[cfg(not(windows))]
+fn read_cwd(pid: u32) -> String {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+#[cfg(windows)]
+fn read_cwd(pid: u32) -> String {
+    win::cwd(pid)
+}
+
+/// utime + stime from /proc/<pid>/stat, in CPU jiffies (10ms each). The comm
+/// field can contain spaces and parens, so split on the *last* ')' before
+/// indexing fields.
+#[cfg(not(windows))]
 fn read_cpu_jiffies(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_, rest) = stat.rsplit_once(')')?;
@@ -156,20 +259,35 @@ fn read_cpu_jiffies(pid: u32) -> Option<u64> {
     Some(utime + stime)
 }
 
-/// Terminate a non-tmux agent session by pid (SIGTERM).
+#[cfg(windows)]
+fn read_cpu_jiffies(pid: u32) -> Option<u64> {
+    win::cpu_jiffies(pid)
+}
+
+/// Terminate a non-tmux agent session by pid.
 pub fn kill(pid_handle: &str) -> Result<(), String> {
     let pid: u32 = pid_handle
         .strip_prefix("pid:")
         .and_then(|p| p.parse().ok())
         .ok_or_else(|| format!("bad pid handle {pid_handle}"))?;
-    let ok = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if ok {
+    if kill_pid(pid) {
         Ok(())
     } else {
         Err(format!("failed to signal pid {pid}"))
     }
+}
+
+/// SIGTERM the pid on Unix; TerminateProcess (via sysinfo) on Windows.
+#[cfg(not(windows))]
+fn kill_pid(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn kill_pid(pid: u32) -> bool {
+    win::kill(pid)
 }

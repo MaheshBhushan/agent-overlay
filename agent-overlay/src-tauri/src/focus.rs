@@ -6,6 +6,18 @@
 //! kdotool uses, without the extra dependency. Elsewhere we fall back to
 //! xdotool / wmctrl when present.
 
+#[cfg(windows)]
+pub fn focus(_handle: &str) -> Result<(), String> {
+    // Window activation is compositor-specific and not yet implemented on
+    // Windows. The UI surfaces this error to the user.
+    Err("focus is not supported yet on Windows".into())
+}
+
+#[cfg(not(windows))]
+pub use unix::focus;
+
+#[cfg(not(windows))]
+mod unix {
 use std::collections::HashMap;
 use std::process::Command;
 
@@ -254,3 +266,4 @@ fn activate_wmctrl(pids: &[u32]) -> Result<(), String> {
     }
     Err("no window found".into())
 }
+} // mod unix
