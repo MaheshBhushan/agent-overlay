@@ -88,13 +88,23 @@ mod win {
         })
     }
 
-    /// Accumulated CPU time for a pid, expressed in 10ms "jiffies" so the
-    /// same ACTIVE_JIFFIES threshold used on Linux applies unchanged.
+    /// Synthetic jiffies for Windows: sysinfo 0.33 has no accumulated_cpu_time,
+    /// so we use cpu_usage() (0–100 %) as an activity signal. Each poll where
+    /// usage > 5 % we add ACTIVE_JIFFIES to a per-pid counter so the outer
+    /// delta-based streak logic behaves identically to Linux.
     pub fn cpu_jiffies(pid: u32) -> Option<u64> {
-        with_system(|sys| {
+        let usage = with_system(|sys| {
             sys.process(sysinfo::Pid::from_u32(pid))
-                .map(|p| p.accumulated_cpu_time() / 10)
-        })
+                .map(|p| p.cpu_usage())
+        })?;
+        static ACCUM: std::sync::Mutex<std::collections::HashMap<u32, u64>> =
+            std::sync::Mutex::new(std::collections::HashMap::new());
+        let mut map = ACCUM.lock().unwrap();
+        let counter = map.entry(pid).or_insert(0);
+        if usage > 5.0 {
+            *counter += 8; // ACTIVE_JIFFIES equivalent
+        }
+        Some(*counter)
     }
 
     pub fn cwd(pid: u32) -> String {
