@@ -1,0 +1,213 @@
+:root {
+  color-scheme: dark;
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+  font-size: 13px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+html,
+body {
+  background: transparent;
+  height: 100%;
+  overflow: hidden;
+}
+
+#hud {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: 100vh;
+  padding: 12px;
+  background: rgba(14, 16, 22, 0.88);
+  border: 1px solid rgba(120, 160, 255, 0.25);
+  border-radius: 12px;
+  color: #d7dce6;
+  backdrop-filter: blur(8px);
+  overflow-y: auto;
+}
+
+#titlebar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  user-select: none;
+  cursor: grab;
+}
+
+.logo {
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #8ab4ff;
+}
+
+.hint {
+  flex: 1;
+  color: #5a627a;
+  font-size: 11px;
+}
+
+.badge {
+  background: #ff9f43;
+  color: #1a1205;
+  border-radius: 10px;
+  padding: 2px 8px;
+  font-weight: 700;
+  font-size: 11px;
+}
+
+button {
+  background: rgba(120, 160, 255, 0.12);
+  border: 1px solid rgba(120, 160, 255, 0.3);
+  border-radius: 6px;
+  color: #d7dce6;
+  cursor: pointer;
+  padding: 3px 9px;
+  font: inherit;
+}
+
+button:hover {
+  background: rgba(120, 160, 255, 0.28);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.card {
+  background: rgba(30, 34, 46, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-left: 3px solid #5a627a;
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.card.status-running { border-left-color: #8ab4ff; }
+.card.status-error { border-left-color: #ff6b6b; }
+.card.status-idle { border-left-color: #4cd97b; }
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-badge {
+  background: #2b3550;
+  color: #8ab4ff;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.term-tag {
+  background: #3a3350;
+  color: #c7a8ff;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.project {
+  flex: 1;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kill {
+  padding: 0 6px;
+  border-color: rgba(255, 107, 107, 0.4);
+  color: #ff8f8f;
+}
+
+.card-status {
+  font-size: 11px;
+  color: #9aa3b8;
+  text-transform: capitalize;
+}
+
+.status-running .dot {
+  color: #8ab4ff;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+.status-error .dot { color: #ff6b6b; }
+.status-idle .dot { color: #4cd97b; }
+
+@keyframes pulse {
+  50% { opacity: 0.25; }
+}
+
+.card-tail {
+  font-size: 10px;
+  color: #6b7288;
+  white-space: pre-wrap;
+  max-height: 42px;
+  overflow: hidden;
+}
+
+.badge.all-idle {
+  background: #4cd97b;
+  color: #06180c;
+}
+
+#empty {
+  text-align: center;
+  color: #5a627a;
+  margin-top: 60px;
+  line-height: 2;
+}
+
+.hidden {
+  display: none !important;
+}
+
+dialog {
+  background: #171a24;
+  border: 1px solid rgba(120, 160, 255, 0.3);
+  border-radius: 10px;
+  color: #d7dce6;
+  padding: 16px;
+  min-width: 320px;
+}
+
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+dialog label {
+  display: block;
+  margin: 10px 0 4px;
+  font-size: 11px;
+  color: #9aa3b8;
+}
+
+dialog input,
+dialog select {
+  width: 100%;
+  background: #10131b;
+  border: 1px solid rgba(120, 160, 255, 0.25);
+  border-radius: 6px;
+  color: inherit;
+  padding: 6px 8px;
+  font: inherit;
+}
+
+dialog menu {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0;
+  margin-top: 14px;
+}

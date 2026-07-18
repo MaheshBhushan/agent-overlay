@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Overlay</title>
+    <script type="module" src="/src/main.ts" defer></script>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="hud">
+      <header id="titlebar" data-tauri-drag-region>
+        <span class="logo" data-tauri-drag-region>⌬ AGENT OVERLAY</span>
+        <span id="status-badge" class="badge hidden">0 running · 0 idle</span>
+        <span class="hint" data-tauri-drag-region>Ctrl+Shift+Space to toggle</span>
+        <button id="btn-refresh" title="Refresh sessions">⟳</button>
+        <button id="btn-launch" title="Launch a new agent session">＋</button>
+        <button id="btn-hide" title="Hide overlay">─</button>
+      </header>
+
+      <section id="sessions" class="grid"></section>
+
+      <div id="empty" class="hidden">
+        <p>No agent sessions found.</p>
+        <p class="hint">Start <code>claude</code>, <code>codex</code>, <code>gemini</code>… in any terminal and they appear here.</p>
+      </div>
+
+      <dialog id="launch-dialog">
+        <form method="dialog" id="launch-form">
+          <h3>Launch agent session</h3>
+          <label>Agent
+            <select id="launch-agent">
+              <option value="claude">claude</option>
+              <option value="codex">codex</option>
+              <option value="gemini">gemini</option>
+              <option value="opencode">opencode</option>
+            </select>
+          </label>
+          <label>Directory
+            <input id="launch-cwd" type="text" placeholder="/path/to/project" />
+          </label>
+          <menu>
+            <button value="cancel">Cancel</button>
+            <button value="ok" id="launch-ok">Launch</button>
+          </menu>
+        </form>
+      </dialog>
+    </div>
+  </body>
+</html>
