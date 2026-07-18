@@ -6,15 +6,27 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::claude_activity;
 use crate::tmux::{agent_from_args, process_table, AgentSession};
 
-/// CPU jiffies a process must burn between two polls to count as running
-/// (10 jiffies ≈ 0.1 s of CPU per ~1 s poll; an idle TUI stays well below).
-const RUNNING_JIFFIES: u64 = 10;
+/// CPU jiffies per poll that count as an "active" sample. Measured: idle
+/// agent TUIs burn 0–1 jiffies/s (cursor blink), actively-executing claude
+/// ~38 jiffies/s. A focus/repaint burst can exceed this for one poll but
+/// not for RUNNING_STREAK consecutive polls.
+const ACTIVE_JIFFIES: u64 = 8;
+/// Consecutive active polls required before a session counts as running.
+const RUNNING_STREAK: u32 = 2;
+/// Seconds without an active sample before a running session goes idle
+/// (bridges brief CPU dips during long tool executions).
+const IDLE_AFTER_SECS: u64 = 10;
+/// Transcript freshness window for claude sessions (writes can lag well
+/// behind the actual work during long tool runs).
+const TRANSCRIPT_WINDOW_SECS: u64 = 120;
 
 struct ProcActivity {
     cpu: u64,
-    last_active: Instant,
+    streak: u32,
+    last_active: Option<Instant>,
 }
 
 static ACTIVITY: Mutex<Option<HashMap<u32, ProcActivity>>> = Mutex::new(None);
@@ -90,18 +102,28 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
         let cpu = read_cpu_jiffies(*pid).unwrap_or(0);
         let entry = activity.entry(*pid).or_insert(ProcActivity {
             cpu,
-            last_active: now,
+            streak: 0,
+            last_active: None, // start as idle until activity is proven
         });
-        if cpu.saturating_sub(entry.cpu) >= RUNNING_JIFFIES {
-            entry.last_active = now;
+        let mut active_sample = cpu.saturating_sub(entry.cpu) >= ACTIVE_JIFFIES;
+        // A repaint burst (focus, typing) can spike CPU; real work also keeps
+        // the session transcript fresh. Require both for claude.
+        if active_sample && agent == "claude" {
+            active_sample = claude_activity::active_within(&cwd, TRANSCRIPT_WINDOW_SECS);
         }
         entry.cpu = cpu;
-        let since_active = now.duration_since(entry.last_active).as_secs();
+        entry.streak = if active_sample { entry.streak + 1 } else { 0 };
+        if entry.streak >= RUNNING_STREAK {
+            entry.last_active = Some(now);
+        }
 
-        let (status, idle_secs) = if since_active < 5 {
-            ("running".to_string(), None)
-        } else {
-            ("idle".to_string(), Some(since_active))
+        let since_active = entry
+            .last_active
+            .map(|t| now.duration_since(t).as_secs());
+        let (status, idle_secs) = match since_active {
+            Some(s) if s < IDLE_AFTER_SECS => ("running".to_string(), None),
+            Some(s) => ("idle".to_string(), Some(s)),
+            None => ("idle".to_string(), None),
         };
 
         sessions.push(AgentSession {

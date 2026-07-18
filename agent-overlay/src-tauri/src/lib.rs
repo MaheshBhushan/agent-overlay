@@ -1,6 +1,13 @@
+mod claude_activity;
+mod focus;
 mod parser;
 mod procscan;
 mod tmux;
+
+/// Re-export for the `focus` example / CLI debugging.
+pub fn focus_handle(handle: &str) -> Result<(), String> {
+    focus::focus(handle)
+}
 
 /// All agent sessions: tmux panes plus agents in plain terminals.
 pub fn discover_sessions() -> Vec<tmux::AgentSession> {
@@ -35,6 +42,12 @@ fn kill_session(pane_id: String) -> Result<(), String> {
 #[tauri::command]
 fn launch_session(agent: String, cwd: String) -> Result<String, String> {
     tmux::launch(&agent, &cwd)
+}
+
+/// Bring the terminal hosting this session to the foreground.
+#[tauri::command]
+fn focus_session(pane_id: String) -> Result<(), String> {
+    focus::focus(&pane_id)
 }
 
 #[tauri::command]
@@ -88,6 +101,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_sessions,
+            focus_session,
             send_text,
             kill_session,
             launch_session,

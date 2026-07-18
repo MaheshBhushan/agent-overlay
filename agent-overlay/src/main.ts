@@ -69,7 +69,7 @@ function render() {
       const srcTag = inTmux
         ? ""
         : `<span class="term-tag" title="Running in a plain terminal (not tmux)">term</span>`;
-      return `<div class="card status-${esc(s.status)}">
+      return `<div class="card status-${esc(s.status)}" data-pane="${esc(s.pane_id)}" title="Double-click to open this session's terminal">
         <div class="card-head">
           <span class="agent-badge">${esc(AGENT_BADGE[s.agent] ?? s.agent.slice(0, 2).toUpperCase())}</span>
           <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
@@ -106,6 +106,15 @@ window.addEventListener("DOMContentLoaded", async () => {
         invoke("kill_session", { paneId: el.dataset.pane });
       }
     }
+  });
+
+  // Double-click a session card → raise its terminal window.
+  document.body.addEventListener("dblclick", (e) => {
+    const card = (e.target as HTMLElement).closest(".card") as HTMLElement | null;
+    if (!card?.dataset.pane || (e.target as HTMLElement).classList.contains("kill")) return;
+    invoke("focus_session", { paneId: card.dataset.pane }).catch((err) =>
+      alert(`Could not open terminal: ${err}`)
+    );
   });
 
   $("#btn-hide").addEventListener("click", () => getCurrentWindow().hide());

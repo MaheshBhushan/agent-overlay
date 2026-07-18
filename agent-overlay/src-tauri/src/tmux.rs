@@ -199,7 +199,13 @@ pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
         let (status, idle_secs) = match parsed.status.as_str() {
             "running" => ("running".to_string(), None),
             // Output still moving → running even without a spinner marker.
-            _ if since_change < ACTIVITY_WINDOW_SECS => ("running".to_string(), None),
+            // For claude, pane content also moves on focus repaints/typing,
+            // so additionally require a fresh session transcript.
+            _ if since_change < ACTIVITY_WINDOW_SECS
+                && (agent != "claude" || crate::claude_activity::active_within(cwd, 120)) =>
+            {
+                ("running".to_string(), None)
+            }
             "error" => ("error".to_string(), Some(since_change)),
             _ => ("idle".to_string(), Some(since_change)),
         };
