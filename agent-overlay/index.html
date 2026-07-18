@@ -15,8 +15,8 @@
         <span class="spacer" data-tauri-drag-region></span>
         <span class="hint" data-tauri-drag-region>Ctrl+Shift+Space to toggle</span>
         <button id="btn-refresh" title="Refresh sessions">⟳</button>
-        <button id="btn-launch" title="Launch a new agent session">＋</button>
-        <button id="btn-hide" title="Hide overlay">─</button>
+        <button id="btn-maximize" title="Maximize">＋</button>
+        <button id="btn-minimize" title="Minimize">─</button>
       </header>
 
       <div id="board">
@@ -47,30 +47,8 @@
 
       <div id="empty" class="hidden">
         <p>No agent sessions found.</p>
-        <p class="hint">Start <code>claude</code>, <code>codex</code>, <code>gemini</code>… in any terminal.</p>
+        <p class="hint">Open <code>claude</code>, <code>codex</code>, <code>gemini</code>… in any terminal — they appear here automatically.</p>
       </div>
-
-      <dialog id="launch-dialog">
-        <form method="dialog" id="launch-form">
-          <h3>Launch agent session</h3>
-          <label>Agent
-            <select id="launch-agent">
-              <option value="claude">claude</option>
-              <option value="codex">codex</option>
-              <option value="gemini">gemini</option>
-              <option value="opencode">opencode</option>
-              <option value="pi">pi</option>
-            </select>
-          </label>
-          <label>Directory
-            <input id="launch-cwd" type="text" placeholder="/path/to/project" />
-          </label>
-          <menu>
-            <button value="cancel">Cancel</button>
-            <button value="ok" id="launch-ok">Launch</button>
-          </menu>
-        </form>
-      </dialog>
     </div>
   </body>
 </html>

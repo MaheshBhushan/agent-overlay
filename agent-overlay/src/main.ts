@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 
 interface AgentSession {
   pane_id: string;
@@ -125,14 +125,18 @@ window.addEventListener("DOMContentLoaded", async () => {
     );
   });
 
-  $("#btn-hide").addEventListener("click", () => getCurrentWindow().hide());
+  const win = getCurrentWindow();
+  let maximized = false;
 
-  // Fallback: handle Ctrl+Shift+Space inside the webview when the overlay
-  // has focus (covers Wayland where the OS-level global shortcut may not fire).
-  window.addEventListener("keydown", (e) => {
-    if (e.ctrlKey && e.shiftKey && e.code === "Space") {
-      e.preventDefault();
-      invoke("toggle_overlay");
+  // ─ hides the overlay; ＋ toggles between default size and maximized.
+  $("#btn-minimize").addEventListener("click", () => win.hide());
+  $("#btn-maximize").addEventListener("click", async () => {
+    if (maximized) {
+      await win.setSize(new LogicalSize(960, 640));
+      maximized = false;
+    } else {
+      await win.maximize();
+      maximized = true;
     }
   });
 
@@ -141,15 +145,17 @@ window.addEventListener("DOMContentLoaded", async () => {
     render();
   });
 
-  const dialog = $("#launch-dialog") as HTMLDialogElement;
-  $("#btn-launch").addEventListener("click", () => dialog.showModal());
-  $("#launch-form").addEventListener("submit", (e) => {
-    const submitter = (e as SubmitEvent).submitter as HTMLButtonElement | null;
-    if (submitter?.value !== "ok") return;
-    const agent = ($("#launch-agent") as HTMLSelectElement).value;
-    const cwd   = ($("#launch-cwd") as HTMLInputElement).value || "~";
-    invoke("launch_session", { agent, cwd }).catch((err) =>
-      alert(`Launch failed: ${err}`)
-    );
+  // Auto-refresh when the overlay gains focus (i.e. after toggle shows it).
+  await listen("tauri://focus", async () => {
+    sessions = await invoke<AgentSession[]>("get_sessions");
+    render();
+  });
+
+  // Fallback: handle Ctrl+Shift+Space inside the webview when it has focus.
+  window.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.shiftKey && e.code === "Space") {
+      e.preventDefault();
+      invoke("toggle_overlay");
+    }
   });
 });

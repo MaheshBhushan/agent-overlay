@@ -22,11 +22,11 @@ body {
   gap: 10px;
   height: 100vh;
   padding: 12px;
-  background: rgba(14, 16, 22, 0.92);
-  border: 1px solid rgba(120, 160, 255, 0.2);
+  background: rgba(10, 12, 18, 0.97);
+  border: 1px solid rgba(120, 160, 255, 0.25);
   border-radius: 12px;
   color: #d7dce6;
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(12px);
 }
 
 /* ── Titlebar ─────────────────────────────────────────────── */
