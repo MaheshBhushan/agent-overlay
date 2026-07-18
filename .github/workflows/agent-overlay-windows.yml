@@ -1,0 +1,72 @@
+name: agent-overlay windows build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "agent-overlay/**"
+      - ".github/workflows/agent-overlay-windows.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: agent-overlay
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            agent-overlay/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('agent-overlay/src-tauri/Cargo.lock') }}
+
+      - name: Install frontend deps
+        run: npm install
+
+      - name: Tauri build
+        id: build
+        shell: bash
+        run: |
+          if npm run tauri build; then
+            echo "bundled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bundling failed; falling back to --no-bundle" >&2
+            npm run tauri build -- --no-bundle
+            echo "bundled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload bare exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-overlay-exe
+          path: agent-overlay/src-tauri/target/release/agent-overlay.exe
+          if-no-files-found: warn
+
+      - name: Upload NSIS installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-overlay-nsis
+          path: agent-overlay/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: ignore
+
+      - name: Upload MSI installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-overlay-msi
+          path: agent-overlay/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: ignore
