@@ -82,12 +82,27 @@ pub fn run() {
             // support (works under X11/XWayland); the tray/UI toggle still works.
             use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
             let shortcut = "ctrl+shift+space";
-            if let Err(e) = app.global_shortcut().on_shortcut(shortcut, |app, _s, event| {
+            match app.global_shortcut().on_shortcut(shortcut, |app, _s, event| {
                 if event.state() == ShortcutState::Pressed {
                     toggle_main_window(app);
                 }
             }) {
-                eprintln!("global shortcut unavailable ({e}); use the window toggle instead");
+                Ok(_) => {}
+                Err(e) => {
+                    // Wayland: X11 XGrab doesn't intercept keys held by native
+                    // Wayland windows. The webview keydown handler in main.ts
+                    // acts as fallback when the overlay itself has focus.
+                    eprintln!("global shortcut registration failed ({e}); \
+                        on Wayland, bind Ctrl+Shift+Space in your compositor \
+                        settings, or use the ─ button + app launcher to toggle.");
+                    // Emit so the UI can show a warning badge.
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.eval("window.__shortcutFailed = true; \
+                            document.querySelector('.hint') && \
+                            (document.querySelector('.hint').textContent = \
+                            'shortcut unavailable on Wayland — use compositor binding')");
+                    }
+                }
             }
 
             // Poll tmux every second and push state to the UI.

@@ -51,7 +51,9 @@ function cardHtml(s: AgentSession): string {
     : `<span class="term-tag" title="Plain terminal (not tmux)">term</span>`;
   const badge = AGENT_BADGE[s.agent] ?? s.agent.slice(0, 2).toUpperCase();
   const idleTag = s.idle_secs != null
-    ? `<span class="card-idle">${fmtDuration(s.idle_secs)}</span>`
+    ? `<span class="card-idle">idle ${fmtDuration(s.idle_secs)}</span>`
+    : s.status === "idle"
+    ? `<span class="card-idle">waiting</span>`
     : "";
   const tailText = s.tail.slice(-2).join("\n").trim();
 
@@ -124,6 +126,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   $("#btn-hide").addEventListener("click", () => getCurrentWindow().hide());
+
+  // Fallback: handle Ctrl+Shift+Space inside the webview when the overlay
+  // has focus (covers Wayland where the OS-level global shortcut may not fire).
+  window.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.shiftKey && e.code === "Space") {
+      e.preventDefault();
+      invoke("toggle_overlay");
+    }
+  });
 
   $("#btn-refresh").addEventListener("click", async () => {
     sessions = await invoke<AgentSession[]>("get_sessions");
