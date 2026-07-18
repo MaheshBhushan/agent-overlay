@@ -97,9 +97,10 @@ mod win {
             sys.process(sysinfo::Pid::from_u32(pid))
                 .map(|p| p.cpu_usage())
         })?;
-        static ACCUM: std::sync::Mutex<std::collections::HashMap<u32, u64>> =
-            std::sync::Mutex::new(std::collections::HashMap::new());
-        let mut map = ACCUM.lock().unwrap();
+        static ACCUM: std::sync::Mutex<Option<std::collections::HashMap<u32, u64>>> =
+            std::sync::Mutex::new(None);
+        let mut guard = ACCUM.lock().unwrap();
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
         let counter = map.entry(pid).or_insert(0);
         if usage > 5.0 {
             *counter += 8; // ACTIVE_JIFFIES equivalent
