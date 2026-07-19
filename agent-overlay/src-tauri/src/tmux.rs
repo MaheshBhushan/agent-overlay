@@ -1,5 +1,5 @@
 //! tmux discovery: find panes running coding agents, capture their output,
-//! and classify each as running / idle / error.
+//! and classify each as running / idle / permission (awaiting approval).
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ pub struct AgentSession {
     pub window_index: String,
     pub agent: String,
     pub cwd: String,
-    /// "running" | "idle" | "error"
+    /// "running" | "idle" | "permission" (waiting for the user to approve)
     pub status: String,
     /// Seconds since the pane's output last changed; None while running.
     pub idle_secs: Option<u64>,
@@ -171,7 +171,7 @@ pub fn capture_pane(pane_id: &str, lines: u32) -> String {
 }
 
 /// Discover all agent sessions across every tmux session, classifying each
-/// as running/idle/error using output markers plus change tracking.
+/// as running/idle/permission using output markers plus change tracking.
 pub fn discover() -> Vec<AgentSession> {
     discover_with_pane_pids().0
 }
@@ -226,6 +226,9 @@ pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
 
         let (status, idle_secs) = match parsed.status.as_str() {
             "running" => ("running".to_string(), None),
+            // An approval dialog blocks the agent even though its output just
+            // changed, so this outranks the activity window.
+            "permission" => ("permission".to_string(), Some(since_change)),
             // Output still moving → running even without a spinner marker.
             // For claude, pane content also moves on focus repaints/typing,
             // so additionally require a fresh session transcript.
@@ -234,7 +237,6 @@ pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
             {
                 ("running".to_string(), None)
             }
-            "error" => ("error".to_string(), Some(since_change)),
             _ => ("idle".to_string(), Some(since_change)),
         };
 

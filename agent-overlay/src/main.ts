@@ -50,7 +50,9 @@ function cardHtml(s: AgentSession): string {
     ? ""
     : `<span class="term-tag" title="Plain terminal (not tmux)">term</span>`;
   const badge = AGENT_BADGE[s.agent] ?? s.agent.slice(0, 2).toUpperCase();
-  const idleTag = s.idle_secs != null
+  const idleTag = s.status === "permission"
+    ? `<span class="card-perm">⚠ approval needed${s.idle_secs != null ? " · " + fmtDuration(s.idle_secs) : ""}</span>`
+    : s.idle_secs != null
     ? `<span class="card-idle">idle ${fmtDuration(s.idle_secs)}</span>`
     : s.status === "idle"
     ? `<span class="card-idle">waiting</span>`
@@ -79,22 +81,25 @@ function render() {
 
   const running = sessions.filter(s => s.status === "running");
   const idle    = sessions.filter(s => s.status === "idle");
-  const errors  = sessions.filter(s => s.status === "error");
+  const perms   = sessions.filter(s => s.status === "permission");
 
   empty.classList.toggle("hidden", sessions.length > 0);
   board.classList.toggle("hidden", sessions.length === 0);
 
-  $("#cards-running").innerHTML = running.map(cardHtml).join("");
-  $("#cards-idle").innerHTML    = idle.map(cardHtml).join("");
-  $("#cards-error").innerHTML   = errors.map(cardHtml).join("");
+  $("#cards-running").innerHTML    = running.map(cardHtml).join("");
+  $("#cards-idle").innerHTML       = idle.map(cardHtml).join("");
+  $("#cards-permission").innerHTML = perms.map(cardHtml).join("");
 
-  $("#count-running").textContent = String(running.length);
-  $("#count-idle").textContent    = String(idle.length);
-  $("#count-error").textContent   = String(errors.length);
+  $("#count-running").textContent    = String(running.length);
+  $("#count-idle").textContent       = String(idle.length);
+  $("#count-permission").textContent = String(perms.length);
 
-  badge.textContent = `${running.length} running · ${idle.length} idle`;
+  badge.textContent = perms.length > 0
+    ? `${perms.length} need approval · ${running.length} running`
+    : `${running.length} running · ${idle.length} idle`;
   badge.classList.toggle("hidden", sessions.length === 0);
-  badge.classList.toggle("all-idle", running.length === 0 && idle.length > 0);
+  badge.classList.toggle("all-idle",
+    perms.length === 0 && running.length === 0 && idle.length > 0);
 }
 
 window.addEventListener("DOMContentLoaded", async () => {

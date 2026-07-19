@@ -1,0 +1,45 @@
+{
+  "//": "Merge the hooks block below into ~/.claude/settings.json (global) or .claude/settings.json (per project). Each hook POSTs a status event to the overlay's listener on 127.0.0.1:8377; when the overlay isn't running, curl fails silently and Claude Code is unaffected. $TMUX_PANE ties the event to the exact tmux pane; cwd is the fallback key for non-tmux sessions.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 -X POST http://127.0.0.1:8377/event -H 'Content-Type: application/json' -d \"{\\\"status\\\":\\\"running\\\",\\\"pane\\\":\\\"$TMUX_PANE\\\",\\\"cwd\\\":\\\"$PWD\\\"}\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 -X POST http://127.0.0.1:8377/event -H 'Content-Type: application/json' -d \"{\\\"status\\\":\\\"running\\\",\\\"pane\\\":\\\"$TMUX_PANE\\\",\\\"cwd\\\":\\\"$PWD\\\"}\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 -X POST http://127.0.0.1:8377/event -H 'Content-Type: application/json' -d \"{\\\"status\\\":\\\"permission\\\",\\\"pane\\\":\\\"$TMUX_PANE\\\",\\\"cwd\\\":\\\"$PWD\\\"}\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s -m 2 -X POST http://127.0.0.1:8377/event -H 'Content-Type: application/json' -d \"{\\\"status\\\":\\\"idle\\\",\\\"pane\\\":\\\"$TMUX_PANE\\\",\\\"cwd\\\":\\\"$PWD\\\"}\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ]
+  }
+}

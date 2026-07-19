@@ -1,5 +1,6 @@
 mod claude_activity;
 mod focus;
+mod hooks;
 mod parser;
 mod procscan;
 mod tmux;
@@ -10,9 +11,21 @@ pub fn focus_handle(handle: &str) -> Result<(), String> {
 }
 
 /// All agent sessions: tmux panes plus agents in plain terminals.
+/// Fresh hook-reported status (hooks.rs) overrides the scraped status —
+/// hooks are exact where present, scraping covers everything else.
 pub fn discover_sessions() -> Vec<tmux::AgentSession> {
     let (mut sessions, pane_pids) = tmux::discover_with_pane_pids();
     sessions.extend(procscan::discover(&pane_pids));
+    for s in &mut sessions {
+        if let Some(status) = hooks::override_for(&s.pane_id, &s.cwd) {
+            if status == "running" {
+                s.idle_secs = None;
+            } else if s.idle_secs.is_none() {
+                s.idle_secs = Some(0);
+            }
+            s.status = status;
+        }
+    }
     sessions
 }
 
@@ -104,6 +117,9 @@ pub fn run() {
                     }
                 }
             }
+
+            // Push-based status events from agent hooks (see hooks/ examples).
+            hooks::serve();
 
             // Poll tmux every second and push state to the UI.
             let handle = app.handle().clone();

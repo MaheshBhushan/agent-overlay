@@ -123,7 +123,7 @@ button:hover {
 
 .col-header.running { color: #8ab4ff; border-bottom-color: #8ab4ff; }
 .col-header.idle    { color: #4cd97b; border-bottom-color: #4cd97b; }
-.col-header.error   { color: #ff6b6b; border-bottom-color: #ff6b6b; }
+.col-header.permission { color: #ffd166; border-bottom-color: #ffd166; }
 
 .col-dot { font-size: 10px; }
 .col-header.running .col-dot { animation: pulse 1.2s ease-in-out infinite; }
@@ -170,7 +170,7 @@ button:hover {
 
 .col-running .card { border-left: 3px solid #8ab4ff; }
 .col-idle    .card { border-left: 3px solid #4cd97b; }
-.col-error   .card { border-left: 3px solid #ff6b6b; }
+.col-permission .card { border-left: 3px solid #ffd166; }
 
 .card-head {
   display: flex;
@@ -235,6 +235,12 @@ button:hover {
 .card-idle {
   flex-shrink: 0;
   color: #4cd97b;
+}
+
+.card-perm {
+  flex-shrink: 0;
+  color: #ffd166;
+  font-weight: 700;
 }
 
 .card-tail {

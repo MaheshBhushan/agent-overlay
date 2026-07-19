@@ -29,7 +29,20 @@ Built with **Tauri v2** (Rust backend, vanilla-TS frontend). Runs on Linux and W
 **Status accuracy:**
 - `running` = 2+ consecutive polls with ≥ 80 ms of CPU activity, and (for Claude) a session transcript updated within the last 120 s. This filters out UI repaints and focus bursts that spike CPU for only one poll.
 - `idle` = no active CPU sample for 10 s. Idle cards show how long they've been idle.
-- `error` = recognized error marker in tmux pane output.
+- `permission` = the agent is blocked on an approval prompt ("Do you want…", "(Y)es/(N)o" in the pane output, or a permission hook event) — shown in the **Needs Approval** column so you can jump straight to sessions waiting on you.
+- **Hook events override scraping**: agents whose CLIs support lifecycle hooks push exact status transitions to a local listener — see [Hooks](#hooks-push-based-status).
+
+## Hooks (push-based status)
+
+Scraping works for every agent with zero setup, but hooks are exact and instant where available. The overlay listens on `http://127.0.0.1:8377/event` for:
+
+```
+POST {"status": "running" | "idle" | "permission", "pane": "$TMUX_PANE", "cwd": "..."}
+```
+
+A fresh hook event overrides the scraped status for that session (`running`/`idle` for 2 min, `permission` stays sticky until answered or 30 min); sessions without hooks fall back to scraping automatically. `pane` ties the event to an exact tmux pane; `cwd` is the fallback key for non-tmux sessions.
+
+For Claude Code, merge [`hooks/claude-code-settings.example.json`](hooks/claude-code-settings.example.json) into `~/.claude/settings.json`: `UserPromptSubmit`/`PreToolUse` → running, `Notification` → needs approval, `Stop` → idle. The curl calls time out silently when the overlay isn't running, so Claude Code is unaffected.
 
 **Windows:** uses the `sysinfo` crate for process scanning and CPU tracking; `ps` and `/proc` are absent so the Windows path is fully self-contained.
 
@@ -87,10 +100,11 @@ npm run tauri build   # release bundle
 ```
 src-tauri/src/
   lib.rs              Tauri commands, 1s poll loop, global shortcut
+  hooks.rs            local listener for push-based status events from agent hooks
   tmux.rs             tmux pane discovery, capture, activity tracking, launch/kill
   procscan.rs         plain-terminal process scanning, CPU streak detection
   claude_activity.rs  Claude transcript freshness check (~/.claude/projects/)
-  parser.rs           running/idle/error heuristics from pane output (unit-tested)
+  parser.rs           running/idle/permission heuristics from pane output (unit-tested)
 src/
   main.ts             HUD frontend — session cards, status badges, actions
   styles.css          dark overlay theme
@@ -104,7 +118,9 @@ src/
 
 ## Roadmap
 
-- [x] tmux session detection with running/idle/error status
+- [x] tmux session detection with running/idle/needs-approval status
+- [x] Hook-event listener (push-based status) with tmux scraping fallback
+- [x] Needs Approval column for sessions blocked on a permission prompt
 - [x] Plain terminal detection (kitty, wezterm, any terminal outside tmux)
 - [x] Accurate running status via CPU streak + Claude transcript freshness
 - [x] Global shortcut toggle
