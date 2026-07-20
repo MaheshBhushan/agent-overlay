@@ -28,6 +28,65 @@ let sessions: AgentSession[] = [];
 const $ = <T extends HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
 
+// ── Sound effects ─────────────────────────────────────────────────────────
+// Synthesized with Web Audio (no asset files). A short two-note "ding" when a
+// session finishes (running → idle); a sharper double-blip when one starts
+// waiting on you (→ permission). Muted by default state persisted per session.
+let audioCtx: AudioContext | null = null;
+let soundOn = localStorage.getItem("sound") !== "off";
+
+function tone(freq: number, startAt: number, dur: number, gain: number) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  osc.type = "sine";
+  osc.frequency.value = freq;
+  const t = audioCtx.currentTime + startAt;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(gain, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.connect(g).connect(audioCtx.destination);
+  osc.start(t);
+  osc.stop(t + dur);
+}
+
+function playSound(kind: "done" | "approval") {
+  if (!soundOn) return;
+  try {
+    audioCtx ??= new AudioContext();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    if (kind === "done") {
+      // gentle rising ding-dong — task completed
+      tone(660, 0, 0.16, 0.18);
+      tone(880, 0.12, 0.22, 0.18);
+    } else {
+      // two quick urgent blips — needs your approval
+      tone(520, 0, 0.09, 0.22);
+      tone(520, 0.14, 0.12, 0.22);
+    }
+  } catch { /* audio unavailable — ignore */ }
+}
+
+// Previous status per pane, to detect transitions between updates.
+let prevStatus = new Map<string, string>();
+let primed = false; // skip sounds on the very first snapshot
+
+function updateSessions(next: AgentSession[]) {
+  if (primed) {
+    for (const s of next) {
+      const before = prevStatus.get(s.pane_id);
+      if (before && before !== s.status) {
+        if (s.status === "idle" && before === "running") playSound("done");
+        else if (s.status === "permission") playSound("approval");
+      }
+    }
+  }
+  prevStatus = new Map(next.map(s => [s.pane_id, s.status]));
+  primed = true;
+  sessions = next;
+  render();
+}
+
 function esc(s: string): string {
   const div = document.createElement("div");
   div.textContent = s;
@@ -106,12 +165,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   render();
 
   await listen<AgentSession[]>("sessions-update", (event) => {
-    sessions = event.payload;
-    render();
+    updateSessions(event.payload);
   });
 
-  sessions = await invoke<AgentSession[]>("get_sessions");
-  render();
+  updateSessions(await invoke<AgentSession[]>("get_sessions"));
 
   document.body.addEventListener("click", (e) => {
     const el = e.target as HTMLElement;
@@ -146,14 +203,26 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   $("#btn-refresh").addEventListener("click", async () => {
-    sessions = await invoke<AgentSession[]>("get_sessions");
-    render();
+    updateSessions(await invoke<AgentSession[]>("get_sessions"));
+  });
+
+  // Mute / unmute the completion + approval sounds.
+  const soundBtn = $("#btn-sound");
+  const renderSoundBtn = () => {
+    soundBtn.textContent = soundOn ? "🔊" : "🔇";
+    soundBtn.title = soundOn ? "Mute sounds" : "Unmute sounds";
+  };
+  renderSoundBtn();
+  soundBtn.addEventListener("click", () => {
+    soundOn = !soundOn;
+    localStorage.setItem("sound", soundOn ? "on" : "off");
+    renderSoundBtn();
+    if (soundOn) playSound("done"); // preview + unlocks AudioContext on gesture
   });
 
   // Auto-refresh when the overlay gains focus (i.e. after toggle shows it).
   await listen("tauri://focus", async () => {
-    sessions = await invoke<AgentSession[]>("get_sessions");
-    render();
+    updateSessions(await invoke<AgentSession[]>("get_sessions"));
   });
 
   // Fallback: handle Ctrl+Shift+Space inside the webview when it has focus.
