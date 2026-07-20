@@ -3,6 +3,7 @@ mod focus;
 mod hooks;
 mod parser;
 mod procscan;
+mod sound;
 mod tmux;
 
 /// Re-export for the `focus` example / CLI debugging.
@@ -85,6 +86,17 @@ fn toggle_overlay(app: tauri::AppHandle) {
     toggle_main_window(&app);
 }
 
+/// Play a status sound natively (bypasses WebView audio). "done" → click,
+/// "approval" → beeps; anything else is ignored.
+#[tauri::command]
+fn play_sound(kind: String) {
+    match kind.as_str() {
+        "done" => sound::play(sound::Sound::Click),
+        "approval" => sound::play(sound::Sound::Approval),
+        _ => {}
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -118,6 +130,9 @@ pub fn run() {
                 }
             }
 
+            // Native audio thread for status sounds (bypasses WebView audio).
+            sound::init();
+
             // Push-based status events from agent hooks (see hooks/ examples).
             hooks::serve();
 
@@ -137,7 +152,8 @@ pub fn run() {
             kill_session,
             launch_session,
             capture_output,
-            toggle_overlay
+            toggle_overlay,
+            play_sound
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

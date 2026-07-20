@@ -29,42 +29,17 @@ const $ = <T extends HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
 
 // ── Sound effects ─────────────────────────────────────────────────────────
-// Synthesized with Web Audio (no asset files). A short two-note "ding" when a
-// session finishes (running → idle); a sharper double-blip when one starts
-// waiting on you (→ permission). Muted by default state persisted per session.
-let audioCtx: AudioContext | null = null;
+// Played natively from the Rust side (see src-tauri/src/sound.rs) via rodio,
+// which talks straight to the system audio backend. This bypasses WebView
+// audio entirely — on Linux, WebKitGTK needs GStreamer's autoaudiosink, which
+// isn't always present, so an in-page <audio>/Web-Audio would stay silent.
+// A click when a session finishes (running → idle); two beeps when one starts
+// waiting on you (→ permission). Mute state persisted in localStorage.
 let soundOn = localStorage.getItem("sound") !== "off";
 
-function tone(freq: number, startAt: number, dur: number, gain: number) {
-  if (!audioCtx) return;
-  const osc = audioCtx.createOscillator();
-  const g = audioCtx.createGain();
-  osc.type = "sine";
-  osc.frequency.value = freq;
-  const t = audioCtx.currentTime + startAt;
-  g.gain.setValueAtTime(0, t);
-  g.gain.linearRampToValueAtTime(gain, t + 0.01);
-  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  osc.connect(g).connect(audioCtx.destination);
-  osc.start(t);
-  osc.stop(t + dur);
-}
-
-function playSound(kind: "done" | "approval") {
-  if (!soundOn) return;
-  try {
-    audioCtx ??= new AudioContext();
-    if (audioCtx.state === "suspended") audioCtx.resume();
-    if (kind === "done") {
-      // gentle rising ding-dong — task completed
-      tone(660, 0, 0.16, 0.18);
-      tone(880, 0.12, 0.22, 0.18);
-    } else {
-      // two quick urgent blips — needs your approval
-      tone(520, 0, 0.09, 0.22);
-      tone(520, 0.14, 0.12, 0.22);
-    }
-  } catch { /* audio unavailable — ignore */ }
+function playSound(kind: "done" | "approval", force = false) {
+  if (!soundOn && !force) return;
+  invoke("play_sound", { kind }).catch(() => { /* audio unavailable — ignore */ });
 }
 
 // Previous status per pane, to detect transitions between updates.
@@ -217,7 +192,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     soundOn = !soundOn;
     localStorage.setItem("sound", soundOn ? "on" : "off");
     renderSoundBtn();
-    if (soundOn) playSound("done"); // preview + unlocks AudioContext on gesture
+    // Always play a test click on the button gesture (even when muting, so you
+    // can verify audio works regardless of state) — also unlocks AudioContext.
+    playSound("done", true);
   });
 
   // Auto-refresh when the overlay gains focus (i.e. after toggle shows it).
