@@ -124,6 +124,75 @@ mod win {
                 .unwrap_or(false)
         })
     }
+
+    /// Is the process still present?
+    pub fn alive(pid: u32) -> bool {
+        with_system(|sys| sys.process(sysinfo::Pid::from_u32(pid)).is_some())
+    }
+
+    /// Close the terminal *tab* hosting an agent, the way `exit` would: walk UP
+    /// from the agent to the shell (the child of the console host), then kill
+    /// that whole subtree. Killing the shell is what makes the console host
+    /// (Windows Terminal / conhost) close the tab — killing only the agent's
+    /// descendants leaves the shell alive and the window open.
+    ///
+    /// The console-host names below are the *stable* Windows session roots (not
+    /// an open-ended list of terminals like the Linux side avoids); we stop the
+    /// upward walk when the parent is one of them, so the shell is the last node
+    /// before the host.
+    pub fn close_agent(agent: u32) {
+        use std::collections::HashMap;
+        let (parent, name): (HashMap<u32, u32>, HashMap<u32, String>) = with_system(|sys| {
+            let mut p = HashMap::new();
+            let mut n = HashMap::new();
+            for (pid, proc_) in sys.processes() {
+                let id = pid.as_u32();
+                p.insert(id, proc_.parent().map(|x| x.as_u32()).unwrap_or(0));
+                n.insert(id, proc_.name().to_string_lossy().to_ascii_lowercase());
+            }
+            (p, n)
+        });
+
+        let is_host = |nm: &str| {
+            matches!(
+                nm,
+                "windowsterminal.exe" | "conhost.exe" | "openconsole.exe" | "explorer.exe"
+                    | "services.exe" | "svchost.exe" | "wininit.exe" | "userinit.exe"
+                    | "winlogon.exe"
+            )
+        };
+
+        // Walk up to the shell = the highest ancestor still below a console host.
+        let mut node = agent;
+        for _ in 0..64 {
+            let par = *parent.get(&node).unwrap_or(&0);
+            if par == 0 {
+                break;
+            }
+            let pname = name.get(&par).map(String::as_str).unwrap_or("");
+            if is_host(pname) {
+                break;
+            }
+            node = par;
+        }
+
+        // Kill node's whole subtree (shell + agent + everything under it).
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (pid, ppid) in &parent {
+            children.entry(*ppid).or_default().push(*pid);
+        }
+        let mut order = Vec::new();
+        let mut stack = vec![node];
+        while let Some(p) = stack.pop() {
+            order.push(p);
+            if let Some(kids) = children.get(&p) {
+                stack.extend(kids);
+            }
+        }
+        for pid in order.into_iter().rev() {
+            kill(pid);
+        }
+    }
 }
 
 /// Windows: expose the sysinfo process table to tmux.rs's process_table().
@@ -276,29 +345,138 @@ fn read_cpu_jiffies(pid: u32) -> Option<u64> {
 }
 
 /// Terminate a non-tmux agent session by pid.
+#[cfg(not(windows))]
+fn proc_comm(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".into())
+}
+
+/// Fields we care about from /proc/<pid>/stat.
+#[cfg(not(windows))]
+struct Stat {
+    ppid: u32,
+    session: u32,
+    tty_nr: i32,
+    comm: String,
+}
+
+#[cfg(not(windows))]
+fn read_stat(pid: u32) -> Option<Stat> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm sits in parens and may itself contain spaces/parens, so span from the
+    // first '(' to the last ')'. Remaining fields are whitespace-separated:
+    //   [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr ...
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    let comm = s.get(open + 1..close)?.to_string();
+    let f: Vec<&str> = s.get(close + 2..)?.split_whitespace().collect();
+    Some(Stat {
+        ppid: f.get(1)?.parse().ok()?,
+        session: f.get(3)?.parse().ok()?,
+        tty_nr: f.get(4)?.parse().ok()?,
+        comm,
+    })
+}
+
+/// Find the terminal emulator hosting an agent — structurally, with no list of
+/// terminal names. A terminal opens a pty, then forks a child that calls
+/// setsid(): that child becomes the *session leader* and gains the pty as its
+/// controlling terminal, while the terminal emulator stays in its own, different
+/// session. So the emulator is precisely "the parent of the agent's session
+/// leader, living in a different session." This holds for konsole, alacritty,
+/// kitty, foot, xterm, gnome-terminal, sshd, … — anything that spawns a pty.
+///
+/// Returns None when there's no controlling terminal (headless / piped) or the
+/// candidate is a system process (pid 1, systemd, login), so we never nuke init.
+#[cfg(not(windows))]
+fn hosting_terminal(agent: u32) -> Option<u32> {
+    let a = read_stat(agent)?;
+    if a.tty_nr == 0 {
+        return None; // no controlling terminal to speak of
+    }
+    let leader = read_stat(a.session)?; // the session leader (usually the shell)
+    let cand = leader.ppid; // its parent = the pty master side = the emulator
+    if cand <= 1 {
+        return None;
+    }
+    let c = read_stat(cand)?;
+    // The real emulator is in a *different* session than the agent, and isn't a
+    // core system process.
+    if c.session == a.session {
+        return None;
+    }
+    if cand == std::process::id() || c.comm.starts_with("systemd") || c.comm == "init"
+        || c.comm == "login"
+    {
+        return None;
+    }
+    Some(cand)
+}
+
 pub fn kill(pid_handle: &str) -> Result<(), String> {
     let pid: u32 = pid_handle
         .strip_prefix("pid:")
         .and_then(|p| p.parse().ok())
         .ok_or_else(|| format!("bad pid handle {pid_handle}"))?;
-    if kill_pid(pid) {
-        Ok(())
-    } else {
-        Err(format!("failed to signal pid {pid}"))
+
+    #[cfg(not(windows))]
+    {
+        let alive = |p: u32| std::path::Path::new(&format!("/proc/{p}")).exists();
+        match hosting_terminal(pid) {
+            Some(term) => {
+                eprintln!(
+                    "[kill] agent pid={pid} -> closing hosting terminal pid={term} comm={}",
+                    proc_comm(term)
+                );
+                kill_group_and_pid(term);
+            }
+            None => {
+                eprintln!("[kill] agent pid={pid}: no distinct terminal, killing agent group only");
+            }
+        }
+        // Always also take down the agent's own group, in case it ignores the
+        // pty hangup or was launched without a terminal.
+        kill_group_and_pid(pid);
+
+        for _ in 0..20 {
+            if !alive(pid) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        return if alive(pid) {
+            Err(format!("failed to kill pid {pid}"))
+        } else {
+            Ok(())
+        };
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows has no pty/session-leader structure, so walk UP to the shell
+        // and kill its subtree — that's what makes the terminal close the tab,
+        // exactly like typing `exit` (killing only the agent leaves the shell
+        // alive and the window open).
+        win::close_agent(pid);
+        if win::alive(pid) {
+            Err(format!("failed to kill pid {pid}"))
+        } else {
+            Ok(())
+        }
     }
 }
 
-/// SIGTERM the pid on Unix; TerminateProcess (via sysinfo) on Windows.
+/// SIGKILL a process group and the pid itself, via the raw syscall (no PATH
+/// dependency). Safe: kill/getpgid with a pid + signal have no memory effects.
 #[cfg(not(windows))]
-fn kill_pid(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn kill_pid(pid: u32) -> bool {
-    win::kill(pid)
+fn kill_group_and_pid(pid: u32) {
+    let p = pid as libc::pid_t;
+    unsafe {
+        let pgid = libc::getpgid(p);
+        if pgid > 0 {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+        libc::kill(p, libc::SIGKILL);
+    }
 }
