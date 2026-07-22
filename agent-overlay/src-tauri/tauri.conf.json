@@ -14,8 +14,8 @@
     "windows": [
       {
         "title": "agent-overlay",
-        "width": 960,
-        "height": 640,
+        "width": 900,
+        "height": 52,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
