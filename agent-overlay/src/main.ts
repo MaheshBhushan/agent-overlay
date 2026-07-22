@@ -1,6 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import {
+  getCurrentWindow,
+  currentMonitor,
+  primaryMonitor,
+  LogicalSize,
+  LogicalPosition,
+  PhysicalPosition,
+} from "@tauri-apps/api/window";
 
 interface AgentSession {
   pane_id: string;
@@ -134,10 +141,111 @@ function render() {
   badge.classList.toggle("hidden", sessions.length === 0);
   badge.classList.toggle("all-idle",
     perms.length === 0 && running.length === 0 && idle.length > 0);
+
+  // Collapsed-pill summary.
+  $("#pill-running").textContent    = String(running.length);
+  $("#pill-idle").textContent       = String(idle.length);
+  $("#pill-permission").textContent = String(perms.length);
+  $("#pill-perm-wrap").classList.toggle("hidden", perms.length === 0);
+  $("#pill").classList.toggle("alert", perms.length > 0);
+}
+
+// ── Collapsed ↔ expanded window sizing ─────────────────────────────────────
+// The window itself shrinks to just the pill when collapsed, so the large
+// transparent area never eats clicks meant for windows underneath. Expanding
+// grows the window and re-centres it at the top of the current monitor.
+// Width is identical in both states — only the height changes. On Wayland a
+// client can't reposition itself, so we must never rely on setPosition to keep
+// the pill centred. Instead the window is always the panel's width, the pill is
+// centred horizontally at the top, and expanding just grows the height DOWNWARD
+// (which the compositor allows). The pill therefore never moves.
+const WIDTH = 900;
+const COLLAPSED = { w: WIDTH, h: 52 };
+const EXPANDED  = { w: WIDTH, h: 620 };
+const TOP_MARGIN = 6;
+const POS_KEY = "winpos"; // persisted window position (physical px)
+
+let expanded = false;
+
+// Expand/collapse only changes the window HEIGHT (width is constant). The top
+// edge stays put, so the centred pill never moves and the panel grows downward.
+async function setExpanded(on: boolean) {
+  if (expanded === on) return;
+  expanded = on;
+  document.body.classList.toggle("expanded", on);
+  const s = on ? EXPANDED : COLLAPSED;
+  await getCurrentWindow()
+    .setSize(new LogicalSize(s.w, s.h))
+    .catch((e) => console.error("resize failed:", e));
+}
+
+// Restore the user's last dropped position; on the very first launch (nothing
+// saved yet) park it at the top-centre of the current monitor.
+async function restorePosition() {
+  const win = getCurrentWindow();
+  const saved = localStorage.getItem(POS_KEY);
+  if (saved) {
+    try {
+      const { x, y } = JSON.parse(saved);
+      await win.setPosition(new PhysicalPosition(x, y));
+      return;
+    } catch { /* fall through to default */ }
+  }
+  let originX = 0;
+  let screenW = window.screen.width;
+  try {
+    const mon = (await currentMonitor()) ?? (await primaryMonitor());
+    if (mon) {
+      const sf = mon.scaleFactor;
+      originX = mon.position.x / sf;
+      screenW = mon.size.width / sf;
+    }
+  } catch { /* fall back to window.screen */ }
+  const x = Math.round(originX + (screenW - COLLAPSED.w) / 2);
+  await win.setPosition(new LogicalPosition(x, TOP_MARGIN));
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
   render();
+
+  // Restore where the user last dropped the pill (or top-centre on first run).
+  const win = getCurrentWindow();
+  await restorePosition().catch((e) =>
+    console.error("initial positioning failed:", e));
+
+  // Float above other windows and stay visible on every workspace. Some
+  // compositors (KDE/KWin, GNOME on Wayland) drop the "keep above" hint on
+  // focus loss, so we re-assert it whenever the overlay is blurred.
+  const assertOverlay = () => {
+    win.setAlwaysOnTop(true).catch(() => {});
+    win.setVisibleOnAllWorkspaces(true).catch(() => {});
+  };
+  assertOverlay();
+  await listen("tauri://blur", assertOverlay);
+  // KWin/Wayland silently drops the "keep above" + "all desktops" hints when
+  // focus or the active virtual desktop changes (and no blur event fires on a
+  // desktop switch), so re-assert them on a steady tick as a safety net.
+  window.setInterval(assertOverlay, 1500);
+
+  // Remember where the user drags it. Only persist while collapsed, so an
+  // on-screen clamp of the *expanded* window can't overwrite the resting spot.
+  let moveTimer: number | undefined;
+  await listen("tauri://move", () => {
+    clearTimeout(moveTimer);
+    moveTimer = window.setTimeout(async () => {
+      if (expanded) return;
+      const p = await win.outerPosition();
+      localStorage.setItem(POS_KEY, JSON.stringify({ x: p.x, y: p.y }));
+    }, 300);
+  });
+
+  // Click the pill to drop the panel down; click again to collapse. Dragging is
+  // done from the grip (its own drag-region), so a plain click never drags.
+  const pill = $("#pill");
+  pill.addEventListener("click", (e) => {
+    if ((e.target as HTMLElement).closest(".pill-grip")) return;
+    setExpanded(!expanded);
+  });
 
   await listen<AgentSession[]>("sessions-update", (event) => {
     updateSessions(event.payload);
@@ -162,20 +270,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     );
   });
 
-  const win = getCurrentWindow();
-  let maximized = false;
-
-  // ─ hides the overlay; ＋ toggles between default size and maximized.
-  $("#btn-minimize").addEventListener("click", () => win.hide());
-  $("#btn-maximize").addEventListener("click", async () => {
-    if (maximized) {
-      await win.setSize(new LogicalSize(960, 640));
-      maximized = false;
-    } else {
-      await win.maximize();
-      maximized = true;
-    }
-  });
+  // ─ collapses the panel back to the pill.
+  $("#btn-minimize").addEventListener("click", () => setExpanded(false));
 
   $("#btn-refresh").addEventListener("click", async () => {
     updateSessions(await invoke<AgentSession[]>("get_sessions"));
