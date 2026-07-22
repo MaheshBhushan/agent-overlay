@@ -256,8 +256,24 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.body.addEventListener("click", (e) => {
     const el = e.target as HTMLElement;
     if (el.classList.contains("kill")) {
-      if (confirm("Kill this agent session?")) {
-        invoke("kill_session", { paneId: el.dataset.pane });
+      const pane = el.dataset.pane;
+      if (pane && confirm("Close the whole terminal for this session?")) {
+        // Tear down the backend FIRST (kill the process group), then unmount the
+        // card. Removing it from state before a successful kill would orphan a
+        // live session with no card. The `.exiting` class is a transient exit
+        // animation that ends in a real unmount, never a resting width:0 state.
+        const card = el.closest(".card") as HTMLElement | null;
+        card?.classList.add("exiting");
+        invoke("kill_session", { paneId: pane })
+          .then(() => {
+            // Process is confirmed gone (backend waits for /proc to clear).
+            prevStatus.delete(pane);
+            updateSessions(sessions.filter((s) => s.pane_id !== pane));
+          })
+          .catch((err) => {
+            card?.classList.remove("exiting");
+            alert(`Could not kill session: ${err}`);
+          });
       }
     }
   });
@@ -292,6 +308,26 @@ window.addEventListener("DOMContentLoaded", async () => {
     // can verify audio works regardless of state) — also unlocks AudioContext.
     playSound("done", true);
   });
+
+  // Settings: adjust the expanded panel's opacity (persisted). The value is a
+  // percentage 40–100 mapped to the --panel-alpha CSS variable on :root.
+  const settings = $("#settings");
+  const opacity = $<HTMLInputElement>("#opacity");
+  const opacityVal = $("#opacity-val");
+  const applyOpacity = (pct: number) => {
+    document.documentElement.style.setProperty("--panel-alpha", String(pct / 100));
+    opacityVal.textContent = `${pct}%`;
+  };
+  const savedOpacity = parseInt(localStorage.getItem("panelOpacity") ?? "97", 10);
+  opacity.value = String(savedOpacity);
+  applyOpacity(savedOpacity);
+  opacity.addEventListener("input", () => {
+    const pct = parseInt(opacity.value, 10);
+    applyOpacity(pct);
+    localStorage.setItem("panelOpacity", String(pct));
+  });
+  $("#btn-settings").addEventListener("click", () =>
+    settings.classList.toggle("hidden"));
 
   // Auto-refresh when the overlay gains focus (i.e. after toggle shows it).
   await listen("tauri://focus", async () => {
