@@ -9,6 +9,17 @@
   </head>
   <body>
     <div id="hud">
+      <!-- Collapsed pill: always visible, top-center. Hover / click to expand. -->
+      <div id="pill" title="Click to expand · drag the grip to move">
+        <span class="pill-grip" data-tauri-drag-region title="Drag to move">⠿</span>
+        <span class="pill-logo">⌬</span>
+        <span class="pill-stat run"><i>●</i><b id="pill-running">0</b></span>
+        <span class="pill-stat idle"><i>○</i><b id="pill-idle">0</b></span>
+        <span class="pill-stat perm hidden" id="pill-perm-wrap"><i>⚠</i><b id="pill-permission">0</b></span>
+        <span class="pill-chevron">⌄</span>
+      </div>
+
+      <div id="panel">
       <header id="titlebar" data-tauri-drag-region>
         <span class="logo" data-tauri-drag-region>⌬ AGENT OVERLAY</span>
         <span id="status-badge" class="badge hidden">0 running · 0 idle</span>
@@ -16,8 +27,7 @@
         <span class="hint" data-tauri-drag-region>Ctrl+Shift+Space to toggle</span>
         <button id="btn-sound" title="Mute sounds">🔊</button>
         <button id="btn-refresh" title="Refresh sessions">⟳</button>
-        <button id="btn-maximize" title="Maximize">＋</button>
-        <button id="btn-minimize" title="Minimize">─</button>
+        <button id="btn-minimize" title="Collapse">─</button>
       </header>
 
       <div id="board">
@@ -49,6 +59,7 @@
       <div id="empty" class="hidden">
         <p>No agent sessions found.</p>
         <p class="hint">Open <code>claude</code>, <code>codex</code>, <code>gemini</code>… in any terminal — they appear here automatically.</p>
+      </div>
       </div>
     </div>
   </body>
