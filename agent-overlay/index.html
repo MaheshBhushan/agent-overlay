@@ -26,9 +26,18 @@
         <span class="spacer" data-tauri-drag-region></span>
         <span class="hint" data-tauri-drag-region>Ctrl+Shift+Space to toggle</span>
         <button id="btn-sound" title="Mute sounds">🔊</button>
+        <button id="btn-settings" title="Settings">⚙</button>
         <button id="btn-refresh" title="Refresh sessions">⟳</button>
         <button id="btn-minimize" title="Collapse">─</button>
       </header>
+
+      <div id="settings" class="hidden">
+        <label class="set-row" for="opacity">
+          <span>Panel opacity</span>
+          <input id="opacity" type="range" min="40" max="100" step="1" value="97" />
+          <span id="opacity-val" class="set-val">97%</span>
+        </label>
+      </div>
 
       <div id="board">
         <div class="column" id="col-running">
