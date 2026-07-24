@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::claude_activity;
+use crate::claude_status;
 use crate::tmux::{agent_from_args, process_table, AgentSession};
 
 /// CPU jiffies per poll that count as an "active" sample. Measured: idle
@@ -19,9 +19,6 @@ const RUNNING_STREAK: u32 = 2;
 /// Seconds without an active sample before a running session goes idle
 /// (bridges brief CPU dips during long tool executions).
 const IDLE_AFTER_SECS: u64 = 10;
-/// Transcript freshness window for claude sessions (writes can lag well
-/// behind the actual work during long tool runs).
-const TRANSCRIPT_WINDOW_SECS: u64 = 120;
 
 struct ProcActivity {
     cpu: u64,
@@ -273,12 +270,7 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
             streak: 0,
             last_active: None, // start as idle until activity is proven
         });
-        let mut active_sample = cpu.saturating_sub(entry.cpu) >= ACTIVE_JIFFIES;
-        // A repaint burst (focus, typing) can spike CPU; real work also keeps
-        // the session transcript fresh. Require both for claude.
-        if active_sample && agent == "claude" {
-            active_sample = claude_activity::active_within(&cwd, TRANSCRIPT_WINDOW_SECS);
-        }
+        let active_sample = cpu.saturating_sub(entry.cpu) >= ACTIVE_JIFFIES;
         entry.cpu = cpu;
         entry.streak = if active_sample { entry.streak + 1 } else { 0 };
         if entry.streak >= RUNNING_STREAK {
@@ -288,10 +280,22 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
         let since_active = entry
             .last_active
             .map(|t| now.duration_since(t).as_secs());
-        let (status, idle_secs) = match since_active {
-            Some(s) if s < IDLE_AFTER_SECS => ("running".to_string(), None),
-            Some(s) => ("idle".to_string(), Some(s)),
-            None => ("idle".to_string(), None),
+        // Prefer claude's own per-pid status: it is exact and, unlike the CPU
+        // heuristic, never confuses two claude sessions that share one cwd
+        // (a focus/typing repaint in the idle one no longer reads as running
+        // just because its sibling is working). Fall back to the CPU streak
+        // for non-claude agents and pre-status claude builds.
+        let (status, idle_secs) = match (agent == "claude")
+            .then(|| claude_status::status_for_pid(*pid))
+            .flatten()
+        {
+            Some(cs) if cs.busy => ("running".to_string(), None),
+            Some(cs) => ("idle".to_string(), Some(cs.since_status_secs)),
+            None => match since_active {
+                Some(s) if s < IDLE_AFTER_SECS => ("running".to_string(), None),
+                Some(s) => ("idle".to_string(), Some(s)),
+                None => ("idle".to_string(), None),
+            },
         };
 
         sessions.push(AgentSession {

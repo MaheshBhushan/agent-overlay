@@ -1,4 +1,4 @@
-mod claude_activity;
+mod claude_status;
 mod focus;
 mod hooks;
 mod parser;

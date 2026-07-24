@@ -130,10 +130,16 @@ pub fn agent_from_args(args: &str) -> Option<String> {
 
 /// Find which agent (if any) runs inside a pane by walking the process tree
 /// rooted at the pane's shell pid. Handles agents that show up as `node`.
-fn detect_agent(pane_pid: u32, pane_cmd: &str, table: &HashMap<u32, (u32, String)>) -> Option<String> {
+/// Returns the agent label and the pid of the agent process itself (needed to
+/// look up its per-pid session status), not the pane's shell pid.
+fn detect_agent(
+    pane_pid: u32,
+    pane_cmd: &str,
+    table: &HashMap<u32, (u32, String)>,
+) -> Option<(String, u32)> {
     for (name, label) in AGENTS {
         if pane_cmd == *name {
-            return Some(label.to_string());
+            return Some((label.to_string(), pane_pid));
         }
     }
     let mut stack = vec![pane_pid];
@@ -145,7 +151,7 @@ fn detect_agent(pane_pid: u32, pane_cmd: &str, table: &HashMap<u32, (u32, String
         }
         if let Some((_, args)) = table.get(&pid) {
             if let Some(label) = agent_from_args(args) {
-                return Some(label);
+                return Some((label, pid));
             }
         }
         for (child, (ppid, _)) in table.iter() {
@@ -205,7 +211,7 @@ pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
             (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]);
         let Ok(pid) = pid.parse::<u32>() else { continue };
         pane_pids.push(pid);
-        let Some(agent) = detect_agent(pid, cmd, &table) else {
+        let Some((agent, agent_pid)) = detect_agent(pid, cmd, &table) else {
             continue;
         };
         seen.push(pane_id.to_string());
@@ -224,20 +230,28 @@ pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
         }
         let since_change = now.duration_since(entry.last_change).as_secs();
 
+        // Claude's own per-pid status resolves the running/idle ambiguity
+        // exactly, and (unlike the pane-content heuristic) doesn't misread a
+        // focus/typing repaint as work — nor let a sibling session in the same
+        // cwd flip this one to running. Checked lazily, only for claude panes
+        // that aren't already pinned by a spinner or approval dialog.
+        let claude_status =
+            (agent == "claude").then(|| crate::claude_status::status_for_pid(agent_pid)).flatten();
         let (status, idle_secs) = match parsed.status.as_str() {
             "running" => ("running".to_string(), None),
             // An approval dialog blocks the agent even though its output just
-            // changed, so this outranks the activity window.
+            // changed, so this outranks everything below.
             "permission" => ("permission".to_string(), Some(since_change)),
-            // Output still moving → running even without a spinner marker.
-            // For claude, pane content also moves on focus repaints/typing,
-            // so additionally require a fresh session transcript.
-            _ if since_change < ACTIVITY_WINDOW_SECS
-                && (agent != "claude" || crate::claude_activity::active_within(cwd, 120)) =>
-            {
-                ("running".to_string(), None)
-            }
-            _ => ("idle".to_string(), Some(since_change)),
+            _ => match claude_status {
+                Some(cs) if cs.busy => ("running".to_string(), None),
+                Some(cs) => ("idle".to_string(), Some(cs.since_status_secs)),
+                // Non-claude agent (or pre-status build): output still moving →
+                // running even without a spinner marker.
+                None if since_change < ACTIVITY_WINDOW_SECS => {
+                    ("running".to_string(), None)
+                }
+                None => ("idle".to_string(), Some(since_change)),
+            },
         };
 
         sessions.push(AgentSession {
