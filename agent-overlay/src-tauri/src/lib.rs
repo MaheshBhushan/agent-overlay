@@ -19,6 +19,15 @@ pub fn discover_sessions() -> Vec<tmux::AgentSession> {
     sessions.extend(procscan::discover(&pane_pids));
     for s in &mut sessions {
         if let Some(status) = hooks::override_for(&s.pane_id, &s.cwd) {
+            // For claude, running/idle already comes from its authoritative
+            // per-pid session file (procscan/tmux). A hook keyed only on cwd
+            // (non-tmux sessions send no pane id) can't tell two claude
+            // sessions in one folder apart, so honouring its running/idle would
+            // flip an idle sibling whenever the other works. Take only the one
+            // state the status file lacks — permission (awaiting approval).
+            if s.agent == "claude" && status != "permission" {
+                continue;
+            }
             if status == "running" {
                 s.idle_secs = None;
             } else if s.idle_secs.is_none() {
