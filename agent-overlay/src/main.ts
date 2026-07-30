@@ -154,29 +154,125 @@ function render() {
 // The window itself shrinks to just the pill when collapsed, so the large
 // transparent area never eats clicks meant for windows underneath. Expanding
 // grows the window and re-centres it at the top of the current monitor.
-// Width is identical in both states — only the height changes. On Wayland a
-// client can't reposition itself, so we must never rely on setPosition to keep
-// the pill centred. Instead the window is always the panel's width, the pill is
-// centred horizontally at the top, and expanding just grows the height DOWNWARD
-// (which the compositor allows). The pill therefore never moves.
+// On Wayland a client can't reposition itself, so we must never rely on
+// setPosition to keep the pill centred. There the window is always the panel's
+// width, the pill is centred horizontally at the top, and expanding just grows
+// the height DOWNWARD (which the compositor allows). The pill never moves.
+//
+// Windows/WebView2 does not get that luxury: it paints the transparent host
+// window as a visible glass slab, so a 900px-wide window around a ~200px pill
+// shows a large translucent rectangle (issue #1). There the collapsed window is
+// sized to the measured pill instead, and since Windows *does* honour
+// setPosition we re-centre the window on every width change so the pill stays
+// put.
 const WIDTH = 900;
-const COLLAPSED = { w: WIDTH, h: 52 };
-const EXPANDED  = { w: WIDTH, h: 620 };
+const COLLAPSED_H = 52;
+const EXPANDED_H = 620;
 const TOP_MARGIN = 6;
+const HUD_PADDING = 12; // #hud's 6px padding on each side, see styles.css
 const POS_KEY = "winpos"; // persisted window position (physical px)
+const IS_WINDOWS = /Windows/i.test(navigator.userAgent);
+
+const MIN_PILL_W = 80; // sanity floor; a smaller measurement means "not laid out yet"
 
 let expanded = false;
+// Window sizing is only allowed once the startup sequence below has placed the
+// window. Before that, a stray resize would race restorePosition() and the
+// resulting position would be persisted by the tauri://move listener.
+let sizingReady = false;
+// Serialises resizes. Every resize spans several awaits, and both the pill's
+// width changing and the user expanding can trigger one; without this a stale
+// continuation could shrink an already-expanded window back to pill size.
+let sizingChain: Promise<void> = Promise.resolve();
 
-// Expand/collapse only changes the window HEIGHT (width is constant). The top
-// edge stays put, so the centred pill never moves and the panel grows downward.
+// Logical width of the collapsed window. Everywhere but Windows this is the full
+// panel width. On Windows it hugs the pill, which changes width as the counters
+// grow and as the permission badge appears. Returns null if the pill has not
+// been laid out yet, in which case the caller must leave the window alone.
+function collapsedWidth(): number | null {
+  if (!IS_WINDOWS) return WIDTH;
+  const pill = Math.ceil($("#pill").getBoundingClientRect().width);
+  if (!Number.isFinite(pill) || pill < MIN_PILL_W) return null;
+  return pill + HUD_PADDING;
+}
+
+// Expand/collapse changes the window height; on Windows it changes the width
+// too. The top edge stays put and the window keeps its centre, so the centred
+// pill never moves and the panel grows downward.
 async function setExpanded(on: boolean) {
   if (expanded === on) return;
   expanded = on;
   document.body.classList.toggle("expanded", on);
-  const s = on ? EXPANDED : COLLAPSED;
-  await getCurrentWindow()
-    .setSize(new LogicalSize(s.w, s.h))
-    .catch((e) => console.error("resize failed:", e));
+  await applySize();
+}
+
+// Resize the window to whatever the current state calls for, holding its
+// horizontal centre fixed. Calls are serialised and each one re-reads `expanded`
+// at the moment it runs, so the last state wins and nothing lands out of order.
+function applySize(): Promise<void> {
+  sizingChain = sizingChain.then(async () => {
+    const w = expanded ? WIDTH : collapsedWidth();
+    if (w === null) return; // pill not measurable yet; try again on the next change
+    const h = expanded ? EXPANDED_H : COLLAPSED_H;
+    const win = getCurrentWindow();
+
+    // Off Windows the width never changes and setPosition is unreliable on
+    // Wayland, so a bare resize is both sufficient and safer.
+    if (!IS_WINDOWS) {
+      await win.setSize(new LogicalSize(WIDTH, h))
+        .catch((e) => console.error("resize failed:", e));
+      return;
+    }
+
+    // innerSize matches what setSize sets; mixing it with outerSize would leave
+    // a frame-sized residue that this arithmetic would re-apply forever.
+    let before: { x: number; y: number; width: number; scale: number };
+    try {
+      const [pos, size, scale] = await Promise.all([
+        win.outerPosition(), win.innerSize(), win.scaleFactor(),
+      ]);
+      before = { x: pos.x, y: pos.y, width: size.width, scale };
+    } catch (e) {
+      console.error("could not read window geometry:", e);
+      await win.setSize(new LogicalSize(w, h))
+        .catch((err) => console.error("resize failed:", err));
+      return;
+    }
+
+    const wantW = Math.round(w * before.scale);
+    if (wantW === before.width) return; // already the right width; don't touch position
+    await win.setSize(new LogicalSize(w, h))
+      .catch((e) => console.error("resize failed:", e));
+    await win.setPosition(
+      new PhysicalPosition(
+        await clampToMonitor(before.x + Math.round((before.width - wantW) / 2), wantW),
+        before.y,
+      ),
+    ).catch((e) => console.error("reposition failed:", e));
+  }).catch((e) => console.error("sizing failed:", e));
+  return sizingChain;
+}
+
+// Keep a re-centred window on screen: growing the panel around a pill parked
+// near a screen edge would otherwise push half of it onto the next monitor.
+async function clampToMonitor(x: number, widthPx: number): Promise<number> {
+  try {
+    const mon = (await currentMonitor()) ?? (await primaryMonitor());
+    if (!mon) return x;
+    const left = mon.position.x;
+    const right = left + mon.size.width;
+    if (widthPx >= mon.size.width) return left;
+    return Math.min(Math.max(x, left), right - widthPx);
+  } catch {
+    return x;
+  }
+}
+
+// The pill's width changes whenever the counters or the permission badge do, so
+// on Windows the collapsed window has to follow it.
+function syncCollapsedWidth() {
+  if (!IS_WINDOWS || !sizingReady || expanded) return;
+  void applySize();
 }
 
 // Restore the user's last dropped position; on the very first launch (nothing
@@ -201,17 +297,36 @@ async function restorePosition() {
       screenW = mon.size.width / sf;
     }
   } catch { /* fall back to window.screen */ }
-  const x = Math.round(originX + (screenW - COLLAPSED.w) / 2);
+  const x = Math.round(originX + (screenW - (collapsedWidth() ?? WIDTH)) / 2);
   await win.setPosition(new LogicalPosition(x, TOP_MARGIN));
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
-  render();
-
-  // Restore where the user last dropped the pill (or top-centre on first run).
+  // The window starts hidden (see tauri.conf.json) so Windows never flashes the
+  // full-width glass slab before the first resize lands. Size and place it, then
+  // show it — and show it even if that fails, or a broken frontend would leave
+  // no window at all (skipTaskbar hides it from the taskbar too).
   const win = getCurrentWindow();
-  await restorePosition().catch((e) =>
-    console.error("initial positioning failed:", e));
+  try {
+    render(); // lays the pill out, so its width can be measured below
+    const w0 = collapsedWidth();
+    if (w0 !== null) {
+      await win.setSize(new LogicalSize(w0, COLLAPSED_H))
+        .catch((e) => console.error("initial resize failed:", e));
+    }
+    // Restore where the user last dropped the pill (or top-centre on first run).
+    await restorePosition().catch((e) =>
+      console.error("initial positioning failed:", e));
+  } finally {
+    sizingReady = true;
+    await win.show().catch((e) => console.error("initial show failed:", e));
+  }
+
+  // From here on the collapsed window tracks the pill's width, which changes as
+  // the counters grow and as the permission badge appears.
+  if (IS_WINDOWS) {
+    new ResizeObserver(() => syncCollapsedWidth()).observe($("#pill"));
+  }
 
   // Float above other windows and stay visible on every workspace. Some
   // compositors (KDE/KWin, GNOME on Wayland) drop the "keep above" hint on
