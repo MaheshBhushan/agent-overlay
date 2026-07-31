@@ -78,6 +78,31 @@ fn capture_output(pane_id: String) -> String {
     tmux::capture_pane(&pane_id, 200)
 }
 
+/// Unconditionally bring the overlay to the front. Used when a second launch
+/// hands over to this instance — the user asked for the overlay, so showing it
+/// is right even if it was already visible.
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+/// The listener must start accepting the instant the port is bound, well before
+/// the webview exists — otherwise a second launch racing our start-up connects
+/// into the backlog, times out waiting for a reply, and opens its own window.
+/// So handovers that arrive early are parked here and replayed once the app is
+/// up.
+static APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+static SHOW_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn handover_show() {
+    match APP.get() {
+        Some(app) => show_main_window(app),
+        None => SHOW_PENDING.store(true, std::sync::atomic::Ordering::SeqCst),
+    }
+}
+
 fn toggle_main_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let visible = win.is_visible().unwrap_or(true);
@@ -108,6 +133,23 @@ fn play_sound(kind: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Claim the singleton port before building anything. If another overlay is
+    // already up it has been asked to show itself, and this launch is done.
+    match hooks::claim() {
+        // Serve straight away, so a launch racing ours gets a real answer
+        // instead of timing out against a bound-but-silent socket.
+        hooks::Claim::Primary(l) => hooks::serve(l, handover_show),
+        hooks::Claim::Secondary => {
+            eprintln!("agent-overlay is already running; showed the existing overlay.");
+            return;
+        }
+        hooks::Claim::Foreign(e) => eprintln!(
+            "hook listener failed to bind 127.0.0.1:{}: {e}; \
+             starting without push-based status.",
+            hooks::PORT
+        ),
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -177,8 +219,12 @@ pub fn run() {
             // Native audio thread for status sounds (bypasses WebView audio).
             sound::init();
 
-            // Push-based status events from agent hooks (see hooks/ examples).
-            hooks::serve();
+            // The listener is already running (see run()); wire it to the app
+            // now and replay a handover that arrived during start-up.
+            let _ = APP.set(app.handle().clone());
+            if SHOW_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                show_main_window(app.handle());
+            }
 
             // Poll tmux every second and push state to the UI.
             let handle = app.handle().clone();

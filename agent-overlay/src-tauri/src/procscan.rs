@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::claude_status;
 use crate::tmux::{agent_from_args, process_table, AgentSession};
@@ -42,7 +42,7 @@ static ACTIVITY: Mutex<Option<HashMap<u32, ProcActivity>>> = Mutex::new(None);
 /// command-line read already failed to get.
 ///
 /// Lives outside the `win` module so it is compiled and tested on every
-/// platform; only its callers are Windows-specific.
+/// platform; only its caller is Windows-specific.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn match_string(cmd: &str, name: &str) -> String {
     for candidate in [cmd, name] {
@@ -51,6 +51,81 @@ fn match_string(cmd: &str, name: &str) -> String {
         }
     }
     String::new()
+}
+
+/// Shortest gap between two process-table refreshes. Comfortably under the 1s
+/// poll cadence, so every poll still gets fresh data, but well above sysinfo's
+/// 200ms minimum CPU update interval, and long enough that the several reads
+/// within one poll share a single snapshot.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MIN_REFRESH: Duration = Duration::from_millis(500);
+/// cpu_usage() percentage above which a sample counts as activity.
+#[cfg_attr(not(windows), allow(dead_code))]
+const ACTIVE_USAGE_PCT: f32 = 5.0;
+
+/// Decides when the shared process snapshot is rebuilt, and labels each
+/// snapshot with a generation number.
+///
+/// sysinfo derives cpu_usage from the CPU time accumulated since the *previous*
+/// refresh, so refreshing immediately before every read measures over a window
+/// microseconds wide and reports ~0%. One poll reads the table, then a cwd and
+/// a CPU sample per session, so refreshing on each of those is what made busy
+/// agents look idle. Gating on elapsed time keeps the measurement window the
+/// full poll interval and gives every reader in a poll the same snapshot.
+///
+/// The generation exists because sharing a snapshot makes reads no longer
+/// equivalent to measurements: `discover` runs on the 1s poll *and* on window
+/// focus, refresh and startup, so two runs can land inside one refresh window
+/// and read the same cpu_usage figure twice. Counting that as two samples would
+/// let a single busy poll satisfy RUNNING_STREAK.
+///
+/// Lives outside the `win` module so it is compiled and tested on every
+/// platform; only its callers are Windows-specific.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct RefreshGate {
+    last: Option<Instant>,
+    generation: u64,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl RefreshGate {
+    const fn new() -> Self {
+        Self {
+            last: None,
+            generation: 0,
+        }
+    }
+
+    /// Returns whether the caller must refresh before reading, and the
+    /// generation of the snapshot it will then be reading.
+    fn begin(&mut self, now: Instant) -> (bool, u64) {
+        let stale = match self.last {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= MIN_REFRESH,
+        };
+        if stale {
+            self.last = Some(now);
+            self.generation += 1;
+        }
+        (stale, self.generation)
+    }
+}
+
+/// Fold one CPU reading into a session's activity counter, at most once per
+/// snapshot. `counted` is the generation this pid was last credited for; a
+/// snapshot reused by a second reader is the same measurement, not new
+/// evidence, so it must not move the counter again.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn accumulate_sample(counter: u64, counted: u64, generation: u64, usage: f32) -> (u64, u64) {
+    if counted == generation {
+        return (counter, counted);
+    }
+    let counter = if usage > ACTIVE_USAGE_PCT {
+        counter + ACTIVE_JIFFIES
+    } else {
+        counter
+    };
+    (counter, generation)
 }
 
 // --- Windows process/CPU backend (sysinfo) --------------------------------
@@ -67,27 +142,54 @@ mod win {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     /// Shared System kept across polls so CPU accumulation is meaningful and
-    /// process CPU deltas line up with our per-poll cadence.
-    static SYSTEM: Mutex<Option<System>> = Mutex::new(None);
+    /// process CPU deltas line up with our per-poll cadence, alongside the gate
+    /// deciding when to rebuild it. See `RefreshGate`.
+    static SYSTEM: Mutex<(Option<System>, super::RefreshGate)> =
+        Mutex::new((None, super::RefreshGate::new()));
 
-    /// Refresh the shared System's process list (pid, parent, cmd, cwd, cpu).
-    fn with_system<R>(f: impl FnOnce(&System) -> R) -> R {
+    /// Read from the shared process snapshot, rebuilding it first if it has
+    /// aged out. The closure also receives the snapshot's generation, so a
+    /// caller that must not count one measurement twice can tell reads apart.
+    fn with_system<R>(f: impl FnOnce(&System, u64) -> R) -> R {
         let mut guard = SYSTEM.lock().unwrap();
-        let sys = guard.get_or_insert_with(System::new);
+        let (stale, generation) = guard.1.begin(std::time::Instant::now());
+        if stale || guard.0.is_none() {
+            let sys = guard.0.get_or_insert_with(System::new);
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing()
+                    .with_cpu()
+                    .with_cmd(sysinfo::UpdateKind::Always)
+                    .with_cwd(sysinfo::UpdateKind::Always),
+            );
+        }
+        let sys = guard.0.as_ref().expect("snapshot initialized above");
+        f(sys, generation)
+    }
+
+    /// A private, freshly-built process table for the kill path.
+    ///
+    /// Deliberately not the shared snapshot. Killing a terminal's subtree has
+    /// to see processes spawned since the last poll, or a tool child started a
+    /// moment ago is never enumerated and outlives its terminal. Refreshing the
+    /// shared snapshot instead would reset the CPU measurement window that
+    /// `discover` depends on, reintroducing the very bug this change fixes —
+    /// so the kill path keeps its own. No CPU data is requested: it is not
+    /// needed here, and asking for it is what makes a refresh expensive.
+    fn kill_path_system() -> System {
+        let mut sys = System::new();
         sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing()
-                .with_cpu()
-                .with_cmd(sysinfo::UpdateKind::Always)
-                .with_cwd(sysinfo::UpdateKind::Always),
+            ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
         );
-        f(sys)
+        sys
     }
 
     /// pid -> (ppid, joined command line), matching the Linux `ps` table shape.
     pub fn process_table() -> std::collections::HashMap<u32, (u32, String)> {
-        with_system(|sys| {
+        with_system(|sys, _| {
             let mut table = std::collections::HashMap::new();
             for (pid, proc_) in sys.processes() {
                 let ppid = proc_.parent().map(|p| p.as_u32()).unwrap_or(0);
@@ -109,23 +211,26 @@ mod win {
     /// usage > 5 % we add ACTIVE_JIFFIES to a per-pid counter so the outer
     /// delta-based streak logic behaves identically to Linux.
     pub fn cpu_jiffies(pid: u32) -> Option<u64> {
-        let usage = with_system(|sys| {
-            sys.process(sysinfo::Pid::from_u32(pid))
-                .map(|p| p.cpu_usage())
-        })?;
-        static ACCUM: std::sync::Mutex<Option<std::collections::HashMap<u32, u64>>> =
+        let (usage, generation) = with_system(|sys, generation| {
+            (
+                sys.process(sysinfo::Pid::from_u32(pid))
+                    .map(|p| p.cpu_usage()),
+                generation,
+            )
+        });
+        let usage = usage?;
+        // counter, plus the snapshot generation it was last credited for.
+        static ACCUM: std::sync::Mutex<Option<std::collections::HashMap<u32, (u64, u64)>>> =
             std::sync::Mutex::new(None);
         let mut guard = ACCUM.lock().unwrap();
         let map = guard.get_or_insert_with(std::collections::HashMap::new);
-        let counter = map.entry(pid).or_insert(0);
-        if usage > 5.0 {
-            *counter += 8; // ACTIVE_JIFFIES equivalent
-        }
-        Some(*counter)
+        let entry = map.entry(pid).or_insert((0, 0));
+        *entry = super::accumulate_sample(entry.0, entry.1, generation, usage);
+        Some(entry.0)
     }
 
     pub fn cwd(pid: u32) -> String {
-        with_system(|sys| {
+        with_system(|sys, _| {
             sys.process(sysinfo::Pid::from_u32(pid))
                 .and_then(|p| p.cwd())
                 .map(|p| p.to_string_lossy().into_owned())
@@ -133,17 +238,13 @@ mod win {
         })
     }
 
-    pub fn kill(pid: u32) -> bool {
-        with_system(|sys| {
-            sys.process(sysinfo::Pid::from_u32(pid))
-                .map(|p| p.kill())
-                .unwrap_or(false)
-        })
-    }
-
-    /// Is the process still present?
+    /// Is the process still present? Called immediately after a kill to decide
+    /// whether it worked, so it must not answer from a snapshot taken before
+    /// the kill — that would report a false failure for a successful kill.
     pub fn alive(pid: u32) -> bool {
-        with_system(|sys| sys.process(sysinfo::Pid::from_u32(pid)).is_some())
+        kill_path_system()
+            .process(sysinfo::Pid::from_u32(pid))
+            .is_some()
     }
 
     /// Close the terminal *tab* hosting an agent, the way `exit` would: walk UP
@@ -158,16 +259,14 @@ mod win {
     /// before the host.
     pub fn close_agent(agent: u32) {
         use std::collections::HashMap;
-        let (parent, name): (HashMap<u32, u32>, HashMap<u32, String>) = with_system(|sys| {
-            let mut p = HashMap::new();
-            let mut n = HashMap::new();
-            for (pid, proc_) in sys.processes() {
-                let id = pid.as_u32();
-                p.insert(id, proc_.parent().map(|x| x.as_u32()).unwrap_or(0));
-                n.insert(id, proc_.name().to_string_lossy().to_ascii_lowercase());
-            }
-            (p, n)
-        });
+        let sys = kill_path_system();
+        let mut parent: HashMap<u32, u32> = HashMap::new();
+        let mut name: HashMap<u32, String> = HashMap::new();
+        for (pid, proc_) in sys.processes() {
+            let id = pid.as_u32();
+            parent.insert(id, proc_.parent().map(|x| x.as_u32()).unwrap_or(0));
+            name.insert(id, proc_.name().to_string_lossy().to_ascii_lowercase());
+        }
 
         let is_host = |nm: &str| {
             matches!(
@@ -206,7 +305,9 @@ mod win {
             }
         }
         for pid in order.into_iter().rev() {
-            kill(pid);
+            if let Some(p) = sys.process(sysinfo::Pid::from_u32(pid)) {
+                p.kill();
+            }
         }
     }
 }
@@ -482,6 +583,16 @@ pub fn kill(pid_handle: &str) -> Result<(), String> {
         // exactly like typing `exit` (killing only the agent leaves the shell
         // alive and the window open).
         win::close_agent(pid);
+        // TerminateProcess is asynchronous: the process stays in the table
+        // until its threads reap, so a single immediate check reports a false
+        // failure for a kill that did work. Same settle loop as the Linux
+        // branch above.
+        for _ in 0..20 {
+            if !win::alive(pid) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
         if win::alive(pid) {
             Err(format!("failed to kill pid {pid}"))
         } else {
@@ -648,5 +759,103 @@ mod tests {
                 "{host} must not match, or it would shadow the agent beneath it"
             );
         }
+    }
+
+    /// The poll cadence in lib.rs. Kept here so the gate is checked against the
+    /// interval it actually has to fit inside.
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    /// The bug: one `discover` reads the table, then a cwd and a CPU sample per
+    /// session. Under the old code each of those refreshed, so every CPU read
+    /// measured over a window microseconds wide and reported ~0%. All the reads
+    /// in one poll must now come from a single refresh.
+    #[test]
+    fn one_poll_refreshes_once_however_many_reads() {
+        let mut gate = RefreshGate::new();
+        let t0 = Instant::now();
+        let reads = [0, 0, 1, 2, 7, 30, 120, 499];
+        let refreshes = reads
+            .iter()
+            .filter(|ms| gate.begin(t0 + Duration::from_millis(**ms)).0)
+            .count();
+        assert_eq!(refreshes, 1, "a single poll must refresh exactly once");
+    }
+
+    /// ...and every read in that poll must see the same snapshot, or the
+    /// double-count guard cannot tell them apart.
+    #[test]
+    fn reads_within_one_poll_share_a_generation() {
+        let mut gate = RefreshGate::new();
+        let t0 = Instant::now();
+        let gens: Vec<u64> = [0, 3, 60, 499]
+            .iter()
+            .map(|ms| gate.begin(t0 + Duration::from_millis(*ms)).1)
+            .collect();
+        assert_eq!(gens, vec![1, 1, 1, 1]);
+    }
+
+    /// The next poll must still get fresh data and a new generation — the gate
+    /// cannot be so wide that it starves the cadence.
+    #[test]
+    fn each_poll_gets_a_new_snapshot() {
+        let mut gate = RefreshGate::new();
+        let t0 = Instant::now();
+        for poll in 0..5u32 {
+            let at = t0 + POLL_INTERVAL * poll;
+            let (stale, generation) = gate.begin(at);
+            assert!(stale, "poll {poll} must refresh");
+            assert_eq!(generation, u64::from(poll) + 1);
+        }
+    }
+
+    #[test]
+    fn refresh_gap_fits_inside_the_poll_interval() {
+        assert!(
+            MIN_REFRESH < POLL_INTERVAL,
+            "MIN_REFRESH must stay below the poll cadence or polls get stale data"
+        );
+    }
+
+    /// A snapshot reused by a second reader is the same measurement, not new
+    /// evidence. `discover` also runs on focus/refresh/startup, so without this
+    /// one busy poll could be counted twice and satisfy RUNNING_STREAK alone.
+    #[test]
+    fn a_reused_snapshot_does_not_count_twice() {
+        let (counter, counted) = accumulate_sample(0, 0, 1, 90.0);
+        assert_eq!(counter, ACTIVE_JIFFIES, "first read of a snapshot counts");
+        let (again, _) = accumulate_sample(counter, counted, 1, 90.0);
+        assert_eq!(again, counter, "the same snapshot must not count again");
+    }
+
+    /// Consecutive busy snapshots still accumulate, or nothing ever reaches
+    /// RUNNING_STREAK.
+    #[test]
+    fn successive_snapshots_accumulate() {
+        let (mut counter, mut counted) = (0, 0);
+        for generation in 1..=3 {
+            (counter, counted) = accumulate_sample(counter, counted, generation, 90.0);
+        }
+        assert_eq!(counter, ACTIVE_JIFFIES * 3);
+    }
+
+    /// An idle process must not accumulate, but must still be marked as having
+    /// seen the snapshot — otherwise a later reader of the same snapshot could
+    /// credit it.
+    #[test]
+    fn idle_samples_do_not_accumulate() {
+        let (counter, counted) = accumulate_sample(0, 0, 1, 0.0);
+        assert_eq!(counter, 0);
+        assert_eq!(counted, 1, "the snapshot is still consumed");
+        assert_eq!(accumulate_sample(counter, counted, 1, 90.0).0, 0);
+    }
+
+    /// The threshold is a strict greater-than, matching the original sampler.
+    #[test]
+    fn usage_at_the_threshold_is_not_activity() {
+        assert_eq!(accumulate_sample(0, 0, 1, ACTIVE_USAGE_PCT).0, 0);
+        assert_eq!(
+            accumulate_sample(0, 0, 1, ACTIVE_USAGE_PCT + 0.1).0,
+            ACTIVE_JIFFIES
+        );
     }
 }
