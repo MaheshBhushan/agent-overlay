@@ -7,6 +7,12 @@
 //! giving exact, instant status. Events are stored per pane (and per cwd as
 //! a fallback for non-tmux sessions) and override the scraped status while
 //! fresh; scraping remains the source of truth for agents without hooks.
+//!
+//! The same socket doubles as the single-instance lock. Exactly one overlay can
+//! hold 127.0.0.1:8377, so a failed bind means either another overlay is already
+//! running — in which case `POST /show` hands the launch over to it — or an
+//! unrelated program has the port, in which case we carry on without hooks as
+//! before.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -84,8 +90,14 @@ pub fn override_for(pane_id: &str, cwd: &str) -> Option<String> {
     None
 }
 
+/// Identifies our own responses, so a second launch can tell an overlay from
+/// whatever else might be sitting on the port.
+const MARKER: &str = "X-Agent-Overlay";
+
 /// Minimal HTTP request handling: enough for `curl -X POST -d '{...}'`.
-fn handle(stream: TcpStream) -> Option<()> {
+/// `POST /show` is the single-instance handover and invokes `on_show`;
+/// anything else is treated as a hook event.
+fn handle(stream: TcpStream, on_show: &dyn Fn()) -> Option<()> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .ok()?;
@@ -93,6 +105,13 @@ fn handle(stream: TcpStream) -> Option<()> {
     let mut content_length = 0usize;
     let mut line = String::new();
     reader.read_line(&mut line).ok()?; // request line
+    let mut words = line.split_whitespace();
+    let method = words.next().unwrap_or("").to_string();
+    let path = words.next().unwrap_or("").to_string();
+    // /show manipulates the window, so it must not be reachable from a web page.
+    // A browser cannot suppress Origin/Referer on a cross-origin fetch, and a
+    // simple POST is the only shape that gets through without a preflight.
+    let mut from_browser = false;
     loop {
         let mut header = String::new();
         reader.read_line(&mut header).ok()?;
@@ -104,16 +123,96 @@ fn handle(stream: TcpStream) -> Option<()> {
             if k.eq_ignore_ascii_case("content-length") {
                 content_length = v.trim().parse().unwrap_or(0);
             }
+            if k.eq_ignore_ascii_case("origin") || k.eq_ignore_ascii_case("referer") {
+                from_browser = true;
+            }
         }
     }
     let mut body = vec![0u8; content_length.min(64 * 1024)];
     reader.read_exact(&mut body).ok()?;
-    if let Ok(ev) = serde_json::from_slice::<HookEvent>(&body) {
-        record(&ev.status, ev.pane.as_deref(), ev.cwd.as_deref());
+
+    let show = path == "/show" && method.eq_ignore_ascii_case("POST") && !from_browser;
+    if path != "/show" {
+        if let Ok(ev) = serde_json::from_slice::<HookEvent>(&body) {
+            record(&ev.status, ev.pane.as_deref(), ev.cwd.as_deref());
+        }
     }
+    // Answer before showing the window: the caller is waiting on this response
+    // with a short timeout, and raising a window can be slow.
     let mut stream = reader.into_inner();
-    let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+    let _ = stream.write_all(
+        format!("HTTP/1.1 204 No Content\r\n{MARKER}: 1\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+    );
+    let _ = stream.flush();
+    if show {
+        on_show();
+    }
     Some(())
+}
+
+/// Outcome of trying to become the one live overlay.
+pub enum Claim {
+    /// We own the port: this is the only overlay running.
+    Primary(TcpListener),
+    /// Another overlay owns it and has been asked to show itself. This launch
+    /// should exit without opening a second window.
+    Secondary,
+    /// Something that isn't an overlay owns the port. Start anyway, without the
+    /// hook listener — the same degraded mode as before.
+    Foreign(std::io::Error),
+}
+
+/// Try to claim the singleton port, handing the launch to a running overlay if
+/// there is one.
+pub fn claim() -> Claim {
+    claim_on(PORT)
+}
+
+fn claim_on(port: u16) -> Claim {
+    match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => Claim::Primary(l),
+        Err(_) if request_show(port) => Claim::Secondary,
+        // The holder isn't an overlay, or it quit while we were asking. Retry
+        // once before giving up: if it has since exited the port is ours, and
+        // starting without the listener when it is free would silently disable
+        // push-based status for the whole session.
+        Err(_) => match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => Claim::Primary(l),
+            Err(e) => Claim::Foreign(e),
+        },
+    }
+}
+
+/// Ask whoever holds the port to show themselves. True only if something
+/// answered with our marker header. An overlay older than this change replies
+/// without the marker and is treated as foreign, so during an upgrade the new
+/// build will start alongside the old one — once.
+fn request_show(port: u16) -> bool {
+    let timeout = Duration::from_secs(2);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut c) = TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = c.set_read_timeout(Some(timeout));
+    let _ = c.set_write_timeout(Some(timeout));
+    if c.write_all(b"POST /show HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    // Read until the end of the response head; a single read is not guaranteed
+    // to return all of it, and a short read would mean a duplicate window.
+    let mut resp = Vec::new();
+    let mut chunk = [0u8; 128];
+    while !resp.windows(4).any(|w| w == b"\r\n\r\n") && resp.len() < 1024 {
+        match c.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => resp.extend_from_slice(&chunk[..n]),
+            Err(_) => return false,
+        }
+    }
+    let resp = String::from_utf8_lossy(&resp).to_ascii_lowercase();
+    resp.starts_with("http/1.1 204") && resp.contains(&MARKER.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -147,7 +246,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let t = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle(stream);
+            handle(stream, &|| {});
         });
         let body = r#"{"status":"idle","pane":"%77","cwd":"/tmp/x"}"#;
         let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -164,21 +263,125 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 204"));
         assert_eq!(override_for("%77", "/tmp/x").as_deref(), Some("idle"));
     }
-}
 
-/// Start the listener thread. Errors are logged, never fatal: without the
-/// listener the overlay simply falls back to tmux scraping alone.
-pub fn serve() {
-    std::thread::spawn(|| {
-        let listener = match TcpListener::bind(("127.0.0.1", PORT)) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("hook listener failed to bind 127.0.0.1:{PORT}: {e}");
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A second launch finds the port taken, is recognised as a handover, and
+    /// the running instance is told to show itself.
+    #[test]
+    fn second_claim_hands_over_to_the_first() {
+        let shown = Arc::new(AtomicUsize::new(0));
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // First launch owns the port and starts serving.
+        let Claim::Primary(listener) = claim_on(port) else {
+            panic!("first claim on a free port must be primary");
+        };
+        let counter = shown.clone();
+        serve(listener, move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Second launch: port taken, and an overlay answers.
+        assert!(matches!(claim_on(port), Claim::Secondary));
+        wait_until(
+            || shown.load(Ordering::SeqCst) == 1,
+            "primary was never shown",
+        );
+    }
+
+    /// The reply must not wait on the window actually coming up. A primary
+    /// still starting its UI would otherwise blow the requester's timeout and
+    /// the second launch would open a window of its own — the original bug.
+    #[test]
+    fn handover_is_answered_before_the_window_is_raised() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let Claim::Primary(listener) = claim_on(port) else {
+            panic!("first claim on a free port must be primary");
+        };
+        // Far longer than request_show's 2s budget.
+        serve(listener, || std::thread::sleep(Duration::from_secs(6)));
+
+        let started = Instant::now();
+        assert!(matches!(claim_on(port), Claim::Secondary));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "handover blocked on the show callback"
+        );
+    }
+
+    /// A stranger on the port must not be mistaken for an overlay, or the app
+    /// would refuse to start whenever 8377 is occupied. This is also the
+    /// upgrade case: an overlay predating the marker header answers like this,
+    /// so a new build starts alongside an old one exactly once.
+    #[test]
+    fn foreign_listener_is_not_mistaken_for_an_overlay() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut s = stream;
+                let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        // Right status code, no marker header — still not us.
+        assert!(matches!(claim_on(port), Claim::Foreign(_)));
+    }
+
+    /// A browser can reach the port, so /show must ignore anything carrying an
+    /// Origin — otherwise a web page could raise and focus the overlay at will.
+    #[test]
+    fn browser_originated_show_is_ignored() {
+        let shown = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counter = shown.clone();
+        serve(listener, move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            c,
+            "POST /show HTTP/1.1\r\nHost: x\r\nOrigin: http://evil.example\r\n\
+             Content-Length: 0\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = [0u8; 128];
+        let n = c.read(&mut resp).unwrap();
+        assert!(String::from_utf8_lossy(&resp[..n]).starts_with("HTTP/1.1 204"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            shown.load(Ordering::SeqCst),
+            0,
+            "browser request raised the window"
+        );
+    }
+
+    fn wait_until(cond: impl Fn() -> bool, msg: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if cond() {
                 return;
             }
-        };
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{msg}");
+    }
+}
+
+/// Start the listener thread on a port already claimed by [`claim`].
+/// `on_show` runs when a second launch hands its start-up over to us.
+pub fn serve(listener: TcpListener, on_show: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let _ = handle(stream);
+            let _ = handle(stream, &on_show);
         }
     });
 }
