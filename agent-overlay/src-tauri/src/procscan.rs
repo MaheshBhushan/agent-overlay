@@ -28,6 +28,31 @@ struct ProcActivity {
 
 static ACTIVITY: Mutex<Option<HashMap<u32, ProcActivity>>> = Mutex::new(None);
 
+/// The string a process is matched against. Reading a Windows process's command
+/// line needs a PEB read, which fails for anything we can't open with more than
+/// PROCESS_QUERY_LIMITED_INFORMATION — that's how a second opencode.exe in its
+/// own terminal ends up with an empty command line and gets dropped. The
+/// process name comes from the system process table instead, needs no handle,
+/// and is always populated, so it is the fallback. `agent_from_args` normalizes
+/// away the `.exe`, so a bare "opencode.exe" still resolves to opencode.
+///
+/// There is deliberately no executable-path rung: `exe()` is only populated
+/// when the refresh asks for it, which `with_system` below does not, and
+/// requesting it would not help here — it needs the same process handle the
+/// command-line read already failed to get.
+///
+/// Lives outside the `win` module so it is compiled and tested on every
+/// platform; only its caller is Windows-specific.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn match_string(cmd: &str, name: &str) -> String {
+    for candidate in [cmd, name] {
+        if !candidate.trim().is_empty() {
+            return candidate.trim().to_string();
+        }
+    }
+    String::new()
+}
+
 /// Shortest gap between two process-table refreshes. Comfortably under the 1s
 /// poll cadence, so every poll still gets fresh data, but well above sysinfo's
 /// 200ms minimum CPU update interval, and long enough that the several reads
@@ -168,20 +193,14 @@ mod win {
             let mut table = std::collections::HashMap::new();
             for (pid, proc_) in sys.processes() {
                 let ppid = proc_.parent().map(|p| p.as_u32()).unwrap_or(0);
-                let cmd: String = if proc_.cmd().is_empty() {
-                    proc_
-                        .exe()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                } else {
-                    proc_
-                        .cmd()
-                        .iter()
-                        .map(|s| s.to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                };
-                table.insert(pid.as_u32(), (ppid, cmd));
+                let cmd = proc_
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let name = proc_.name().to_string_lossy().into_owned();
+                table.insert(pid.as_u32(), (ppid, super::match_string(&cmd, &name)));
             }
             table
         })
@@ -599,6 +618,148 @@ fn kill_group_and_pid(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_line_wins_over_the_name() {
+        assert_eq!(
+            match_string("node C:\\opencode\\bin.js", "node.exe"),
+            "node C:\\opencode\\bin.js"
+        );
+    }
+
+    /// The reported case: Windows hands back a process whose command line
+    /// cannot be read, and dropping it loses a real session.
+    #[test]
+    fn process_name_is_used_when_the_command_line_is_unreadable() {
+        assert_eq!(match_string("", "opencode.exe"), "opencode.exe");
+    }
+
+    /// sysinfo reports an unreadable command line as an empty argv, which joins
+    /// to "" — but a single empty argument joins to "" as well, so the check has
+    /// to be on the joined string, not on the slice.
+    #[test]
+    fn blank_command_line_falls_through() {
+        assert_eq!(match_string("   ", "opencode.exe"), "opencode.exe");
+        assert_eq!(match_string("", ""), "");
+        assert_eq!(agent_from_args(&match_string("", "")), None);
+    }
+
+    /// The point of the fallback: a name-only process must still resolve to its
+    /// agent through the normal matching path.
+    #[test]
+    fn name_only_process_still_resolves_to_its_agent() {
+        for (name, expected) in [
+            ("opencode.exe", "opencode"),
+            ("claude.exe", "claude"),
+            ("opencode", "opencode"),
+        ] {
+            assert_eq!(
+                agent_from_args(&match_string("", name)).as_deref(),
+                Some(expected),
+                "name {name} should resolve to {expected}"
+            );
+        }
+    }
+
+    /// The risk this change introduces: every process whose command line cannot
+    /// be read now contributes its name instead of an empty string, so the whole
+    /// protected/elevated slice of the Windows process table is newly evaluated
+    /// against the agent list. None of it may match — a false positive would put
+    /// a junk card on the overlay whose ✕ kills a system subtree.
+    #[test]
+    fn common_windows_process_names_are_not_agents() {
+        for name in [
+            "System",
+            "Registry",
+            "smss.exe",
+            "csrss.exe",
+            "wininit.exe",
+            "services.exe",
+            "lsass.exe",
+            "svchost.exe",
+            "winlogon.exe",
+            "explorer.exe",
+            "dwm.exe",
+            "MsMpEng.exe",
+            "audiodg.exe",
+            "fontdrvhost.exe",
+            "spoolsv.exe",
+            "RuntimeBroker.exe",
+            "SearchIndexer.exe",
+            "conhost.exe",
+            "WindowsTerminal.exe",
+            "powershell.exe",
+            "pwsh.exe",
+            "cmd.exe",
+            "node.exe",
+            "python.exe",
+            "python3.exe",
+            "pip.exe",
+            "git.exe",
+            "code.exe",
+            "chrome.exe",
+            "msedge.exe",
+        ] {
+            assert_eq!(
+                agent_from_args(&match_string("", name)),
+                None,
+                "{name} must not be reported as an agent session"
+            );
+        }
+    }
+
+    /// Two independent agent processes stay two sessions: `descendants` only
+    /// excludes tmux-rooted trees, and neither is an ancestor of the other.
+    #[test]
+    fn two_name_only_agents_remain_two_sessions() {
+        let table: HashMap<u32, (u32, String)> = HashMap::from([
+            (4, (0, "System".to_string())),
+            (100, (4, match_string("", "WindowsTerminal.exe"))),
+            (101, (100, match_string("", "opencode.exe"))),
+            (200, (4, match_string("", "WindowsTerminal.exe"))),
+            (201, (200, match_string("", "opencode.exe"))),
+        ]);
+
+        let matched: HashMap<u32, String> = table
+            .iter()
+            .filter_map(|(pid, (_, args))| agent_from_args(args).map(|a| (*pid, a)))
+            .collect();
+        assert_eq!(matched.len(), 2, "both opencode processes must match");
+
+        // Mirror discover()'s top-most filter: neither agent may be shadowed by
+        // a matched ancestor, or one of the two sessions disappears.
+        let tops: Vec<u32> = matched
+            .keys()
+            .copied()
+            .filter(|pid| {
+                let mut cur = *pid;
+                while let Some((ppid, _)) = table.get(&cur) {
+                    if *ppid <= 1 {
+                        break;
+                    }
+                    if matched.contains_key(ppid) {
+                        return false;
+                    }
+                    cur = *ppid;
+                }
+                true
+            })
+            .collect();
+        assert_eq!(tops.len(), 2, "neither session may shadow the other");
+    }
+
+    /// The terminal hosting an agent must not itself match, or it would shadow
+    /// the agent and re-key the session to a pid with no cwd and no status file.
+    #[test]
+    fn host_terminal_names_do_not_shadow_their_agent() {
+        for host in ["WindowsTerminal.exe", "conhost.exe", "cmd.exe", "pwsh.exe"] {
+            assert_eq!(
+                agent_from_args(&match_string("", host)),
+                None,
+                "{host} must not match, or it would shadow the agent beneath it"
+            );
+        }
+    }
 
     /// The poll cadence in lib.rs. Kept here so the gate is checked against the
     /// interval it actually has to fit inside.
