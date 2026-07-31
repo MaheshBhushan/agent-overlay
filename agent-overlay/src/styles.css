@@ -149,6 +149,43 @@ body:not(.expanded) #panel { display: none; }
   color: #d7dce6;
   font-weight: 700;
 }
+
+/* Per-CLI hook state: one chip each, colour-coded by how exact its status is. */
+.set-hooks { margin-top: 8px; }
+
+.hook-list {
+  flex: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.hook-chip {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  border: 1px solid transparent;
+}
+
+.hook-chip.ok       { color: #7ee2a8; border-color: rgba(126, 226, 168, 0.35); }
+.hook-chip.partial  { color: #ffd479; border-color: rgba(255, 212, 121, 0.35); }
+.hook-chip.missing  { color: #ff9b9b; border-color: rgba(255, 155, 155, 0.35); }
+.hook-chip.absent   { color: #5d647a; border-color: rgba(255, 255, 255, 0.08); }
+
+.set-btn {
+  padding: 2px 9px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #d7dce6;
+  background: rgba(138, 180, 255, 0.14);
+  border: 1px solid rgba(138, 180, 255, 0.3);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.set-btn:hover:not(:disabled) { background: rgba(138, 180, 255, 0.24); }
+.set-btn:disabled { opacity: 0.5; cursor: default; }
 body.expanded #panel { animation: dropdown 0.18s ease; }
 
 @keyframes dropdown {

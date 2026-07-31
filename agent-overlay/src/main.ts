@@ -20,6 +20,26 @@ interface AgentSession {
   tail: string[];
 }
 
+/// Mirrors hookinstall::CliHooks — status-hook state for one agent CLI.
+interface CliHooks {
+  id: string;
+  name: string;
+  present: boolean;
+  installed: boolean;
+  outdated: boolean;
+  path: string;
+  exact_approval: boolean;
+  note: string;
+}
+
+/// Mirrors hookinstall::InstallOutcome.
+interface InstallOutcome {
+  id: string;
+  name: string;
+  action: "installed" | "updated" | "unchanged" | "skipped" | "failed";
+  detail: string;
+}
+
 const AGENT_BADGE: Record<string, string> = {
   claude:    "CC",
   codex:     "CX",
@@ -441,8 +461,62 @@ window.addEventListener("DOMContentLoaded", async () => {
     applyOpacity(pct);
     localStorage.setItem("panelOpacity", String(pct));
   });
-  $("#btn-settings").addEventListener("click", () =>
-    settings.classList.toggle("hidden"));
+  // Settings: per-CLI status-hook state, with a one-click (re)install. Hooks
+  // are normally written by the installer or on first run; this is the recovery
+  // path — after upgrading the binary to a new path, or installing a new agent
+  // CLI after the overlay.
+  const hookList = $("#hook-list");
+  const installBtn = $<HTMLButtonElement>("#btn-install-hooks");
+
+  const renderHooks = (clis: CliHooks[]) => {
+    hookList.innerHTML = "";
+    for (const c of clis) {
+      const chip = document.createElement("span");
+      // absent: not on this machine. ok: exact. partial: installed but the CLI
+      // can't report approvals exactly. missing/outdated: needs the button.
+      const state = !c.present ? "absent"
+        : !c.installed ? "missing"
+        : c.exact_approval ? "ok" : "partial";
+      chip.className = `hook-chip ${state}`;
+      chip.textContent = c.id + (c.outdated ? " ⭯" : state === "ok" ? " ✓" : "");
+      chip.title = !c.present
+        ? `${c.name} isn't installed here`
+        : [
+            `${c.name} — ${c.outdated ? "outdated hooks" : c.installed ? "hooks installed" : "hooks not installed"}`,
+            c.path,
+            c.note,
+          ].filter(Boolean).join("\n");
+      hookList.appendChild(chip);
+    }
+    const needed = clis.some((c) => c.present && (!c.installed || c.outdated));
+    installBtn.textContent = needed ? "Install" : "Reinstall";
+  };
+
+  const refreshHooks = async () =>
+    renderHooks(await invoke<CliHooks[]>("hook_status"));
+
+  installBtn.addEventListener("click", async () => {
+    installBtn.disabled = true;
+    installBtn.textContent = "…";
+    try {
+      const outcomes = await invoke<InstallOutcome[]>("install_hooks");
+      const failed = outcomes.filter((o) => o.action === "failed");
+      await refreshHooks();
+      installBtn.title = failed.length
+        ? failed.map((o) => `${o.name}: ${o.detail}`).join("\n")
+        : "Hooks are up to date — restart your agent CLIs to pick them up";
+    } finally {
+      installBtn.disabled = false;
+    }
+  });
+
+  $("#btn-settings").addEventListener("click", () => {
+    settings.classList.toggle("hidden");
+    // Cheap enough to re-read on open, and it keeps the chips honest when a CLI
+    // is installed while the overlay is running.
+    if (!settings.classList.contains("hidden")) void refreshHooks();
+  });
+  void refreshHooks();
 
   // Auto-refresh when the overlay gains focus (i.e. after toggle shows it).
   await listen("tauri://focus", async () => {

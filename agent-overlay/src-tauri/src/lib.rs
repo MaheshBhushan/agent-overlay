@@ -1,5 +1,6 @@
 mod claude_status;
 mod focus;
+mod hookinstall;
 mod hooks;
 mod parser;
 mod procscan;
@@ -131,8 +132,75 @@ fn play_sound(kind: String) {
     }
 }
 
+/// Hook state for every supported agent CLI, for the settings panel.
+#[tauri::command]
+fn hook_status() -> Vec<hookinstall::CliHooks> {
+    hookinstall::status()
+}
+
+/// Install (or refresh) our hooks in every agent CLI present on this machine.
+#[tauri::command]
+fn install_hooks() -> Vec<hookinstall::InstallOutcome> {
+    hookinstall::install_all()
+}
+
+/// Non-GUI invocations. Agent CLIs call this binary to report status, and the
+/// Windows installer calls it to install those hooks — neither should start a
+/// window, claim the singleton port, or spin up a webview.
+///
+/// Returns true if the process handled a command and should exit.
+fn run_cli() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--hook-event") => {
+            // An unknown status is dropped by the listener anyway; nothing to
+            // report back to a hook, which must never fail its agent.
+            if let Some(status) = args.get(1) {
+                hooks::post_event(status);
+            }
+            true
+        }
+        Some("--hook-notify") => {
+            use std::io::Read;
+            let mut payload = String::new();
+            let _ = std::io::stdin().read_to_string(&mut payload);
+            hooks::post_notification(&payload);
+            true
+        }
+        Some("--install-hooks") => {
+            hookinstall::report(&hookinstall::install_all());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether this machine has had hooks installed by any build of the overlay.
+/// Bare-exe and MSI installs have no post-install step to call
+/// `--install-hooks`, so first run does it — otherwise those users would keep
+/// the scraping-only behaviour with no indication anything was missing.
+fn install_hooks_on_first_run(app: &tauri::AppHandle) {
+    let Ok(dir) = app.path().app_config_dir() else {
+        return;
+    };
+    let stamp = dir.join("hooks-installed");
+    if std::fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == hookinstall::HOOKS_VERSION) {
+        return;
+    }
+    let outcomes = hookinstall::install_all();
+    hookinstall::report(&outcomes);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&stamp, hookinstall::HOOKS_VERSION);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Hook reporting and hook installation are one-shot CLI commands; they must
+    // not fall through into starting the overlay.
+    if run_cli() {
+        return;
+    }
+
     // Claim the singleton port before building anything. If another overlay is
     // already up it has been asked to show itself, and this launch is done.
     match hooks::claim() {
@@ -219,6 +287,9 @@ pub fn run() {
             // Native audio thread for status sounds (bypasses WebView audio).
             sound::init();
 
+            // Covers installs with no post-install step (bare exe, MSI).
+            install_hooks_on_first_run(app.handle());
+
             // The listener is already running (see run()); wire it to the app
             // now and replay a handover that arrived during start-up.
             let _ = APP.set(app.handle().clone());
@@ -243,7 +314,9 @@ pub fn run() {
             launch_session,
             capture_output,
             toggle_overlay,
-            play_sound
+            play_sound,
+            hook_status,
+            install_hooks
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

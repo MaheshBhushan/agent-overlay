@@ -94,6 +94,60 @@ pub fn override_for(pane_id: &str, cwd: &str) -> Option<String> {
 /// whatever else might be sitting on the port.
 const MARKER: &str = "X-Agent-Overlay";
 
+/// Report a status transition to a running overlay, then exit. This is the
+/// `--hook-event` path: agent CLIs invoke the overlay binary itself instead of
+/// shelling out to `curl`, which keeps the hook command identical on `sh` and
+/// `cmd.exe` (see hookinstall.rs).
+///
+/// Deliberately silent and always successful from the CLI's point of view — a
+/// hook that fails or blocks would disrupt the agent session it is reporting
+/// on, and the overlay simply falls back to scanning when no event arrives.
+pub fn post_event(status: &str) {
+    post_event_to(PORT, status);
+}
+
+fn post_event_to(port: u16, status: &str) {
+    let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let body = serde_json::json!({ "status": status, "pane": pane, "cwd": cwd }).to_string();
+
+    let timeout = Duration::from_secs(2);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut c) = TcpStream::connect_timeout(&addr, timeout) else {
+        return; // overlay isn't running
+    };
+    let _ = c.set_write_timeout(Some(timeout));
+    let _ = c.write_all(
+        format!(
+            "POST /event HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .as_bytes(),
+    );
+    let _ = c.flush();
+}
+
+/// The `--hook-notify` path. Claude Code's `Notification` hook fires for more
+/// than approvals (idle nudges too), and the distinguishing detail is only in
+/// the JSON payload on stdin — so read it and report a permission request only
+/// when that is what it is.
+pub fn post_notification(payload: &str) {
+    if is_permission_notification(payload) {
+        post_event("permission");
+    }
+}
+
+fn is_permission_notification(payload: &str) -> bool {
+    // Match on the message text rather than a fixed schema: the notification
+    // wording ("Claude needs your permission to use Bash") is stabler across
+    // versions than the envelope around it.
+    payload.to_ascii_lowercase().contains("permission")
+}
+
 /// Minimal HTTP request handling: enough for `curl -X POST -d '{...}'`.
 /// `POST /show` is the single-instance handover and invokes `on_show`;
 /// anything else is treated as a hook event.
@@ -232,6 +286,50 @@ mod tests {
         // A newer event replaces the sticky permission state.
         record("running", Some("%9"), Some("/tmp/proj"));
         assert_eq!(override_for("%9", "/tmp/proj").as_deref(), Some("running"));
+    }
+
+    /// The full `--hook-event` round trip: what an agent CLI's hook actually
+    /// runs must land in the state the overlay reads. Covers the wire format
+    /// the hand-written curl payload used to get wrong.
+    #[test]
+    fn hook_event_cli_reaches_the_listener() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        serve(listener, || {});
+
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        post_event_to(port, "permission");
+        wait_until(
+            || override_for("no-such-pane", &cwd).as_deref() == Some("permission"),
+            "hook event never reached the listener",
+        );
+    }
+
+    /// A hook must never fail or hang its agent, even with no overlay running.
+    #[test]
+    fn posting_with_no_listener_is_harmless() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let started = Instant::now();
+        post_event_to(port, "running");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// Claude's Notification hook also fires for idle nudges; only approval
+    /// notifications may reach the Needs Approval column.
+    #[test]
+    fn only_permission_notifications_count() {
+        assert!(is_permission_notification(
+            r#"{"message":"Claude needs your permission to use Bash"}"#
+        ));
+        assert!(is_permission_notification(
+            r#"{"message":"Permission required"}"#
+        ));
+        assert!(!is_permission_notification(
+            r#"{"message":"Claude is waiting for your input"}"#
+        ));
+        assert!(!is_permission_notification(""));
     }
 
     #[test]

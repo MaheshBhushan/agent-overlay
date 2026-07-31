@@ -42,7 +42,27 @@ POST {"status": "running" | "idle" | "permission", "pane": "$TMUX_PANE", "cwd": 
 
 A fresh hook event overrides the scraped status for that session (`running`/`idle` for 2 min, `permission` stays sticky until answered or 30 min); sessions without hooks fall back to scraping automatically. `pane` ties the event to an exact tmux pane; `cwd` is the fallback key for non-tmux sessions.
 
-For Claude Code, merge [`hooks/claude-code-settings.example.json`](hooks/claude-code-settings.example.json) into `~/.claude/settings.json`: `UserPromptSubmit`/`PreToolUse` → running, `Notification` → needs approval, `Stop` → idle. The curl calls time out silently when the overlay isn't running, so Claude Code is unaffected.
+**Hooks install themselves.** You don't have to merge any JSON by hand:
+
+- The **Windows installer** runs `agent-overlay.exe --install-hooks` after copying files.
+- **Any install** (bare exe, MSI, Linux binary) installs them on first run.
+- **Settings → Status hooks** shows a chip per CLI (`✓` current, `⭯` outdated, dimmed = CLI not installed) with an **Install / Reinstall** button — use it after upgrading to a new binary path, or after installing a new agent CLI.
+- Scripted setups: `agent-overlay --install-hooks`.
+
+| CLI | Installed into | Approval signal |
+|-----|----------------|-----------------|
+| Claude Code | `~/.claude/settings.json` (merged) | `Notification` — only fires when permission mode isn't auto-accept |
+| Codex CLI | `~/.codex/hooks/hooks.json` (merged) | `permission_request` — exact |
+| opencode | `~/.config/opencode/plugin/agent-overlay.ts` | `permission.ask` — exact |
+| pi | `~/.pi/agent/extensions/agent-overlay.ts` | none — pi exposes no approval event, so approvals stay scraped |
+
+Installation is **idempotent and non-destructive**: only hook entries the overlay recognises as its own are ever replaced, everything else in those files is preserved, and the original is copied to `<name>.agent-overlay.bak` before the first edit. An unparseable config is reported and left untouched. Uninstalling the overlay leaves the hooks in place — they are inert without it running.
+
+Command hooks (Claude, codex) invoke the overlay binary — `agent-overlay --hook-event running` — rather than `curl`. That keeps one hook command working under both `sh` and `cmd.exe`; the older hand-merged curl payload used `$TMUX_PANE`, `$PWD`, single-quoted headers and `payload=$(cat)`, none of which `cmd.exe` honours, so **it silently did nothing on Windows**. If you have that payload in your settings, installing replaces it. [`hooks/claude-code-settings.example.json`](hooks/claude-code-settings.example.json) remains for reference only.
+
+Hooks never fail or block their agent: with no overlay running, the connection attempt times out silently.
+
+> Codex's hook event names and file layout are read off the shipped binary (0.144) rather than published docs. If a future codex renames them the hooks simply stop firing and that CLI degrades to scraping.
 
 **Windows:** uses the `sysinfo` crate for process scanning and CPU tracking; `ps` and `/proc` are absent so the Windows path is fully self-contained.
 
@@ -100,7 +120,8 @@ npm run tauri build   # release bundle
 ```
 src-tauri/src/
   lib.rs              Tauri commands, 1s poll loop, global shortcut
-  hooks.rs            local listener for push-based status events from agent hooks
+  hooks.rs            local listener for push-based status events, plus the --hook-event client
+  hookinstall.rs      idempotent hook installation into claude / codex / opencode / pi
   tmux.rs             tmux pane discovery, capture, activity tracking, launch/kill
   procscan.rs         plain-terminal process scanning, CPU streak detection
   claude_activity.rs  Claude transcript freshness check (~/.claude/projects/)
@@ -127,6 +148,7 @@ src/
 - [x] Session launch / kill from overlay
 - [x] Windows support
 - [x] GitHub Releases with Linux + Windows binaries
+- [x] Automatic hook installation (Windows installer, first run, or `--install-hooks`)
 - [ ] Desktop notification when a session goes idle
 - [ ] Per-session output tail in the HUD
 - [ ] Configurable agent list and shortcuts
