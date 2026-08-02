@@ -89,10 +89,25 @@ function updateSessions(next: AgentSession[]) {
   render();
 }
 
+const ESCAPES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+/// Escape for both element and attribute context. The quotes matter: cardHtml
+/// interpolates into `title="…"` and `data-pane="…"`, and cwd/pane_id come
+/// from scanned processes and tmux, so a directory named `x" onmouseover="…`
+/// would otherwise close the attribute and run in the webview.
+///
+/// Done by hand rather than via textContent → innerHTML, which escapes &, <
+/// and > but not quotes — correct for element context, silently wrong for
+/// attributes, and not fixable in place: that escaping is fixed by the HTML
+/// serialization spec.
 function esc(s: string): string {
-  const div = document.createElement("div");
-  div.textContent = s;
-  return div.innerHTML;
+  return s.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
 function projectName(cwd: string): string {
