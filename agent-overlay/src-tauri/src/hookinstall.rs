@@ -124,30 +124,35 @@ fn entry_is_ours(v: &Value) -> bool {
 }
 
 /// Merge `wanted` (event name → our entry) into the `hooks` object of a
-/// settings document, dropping any previous entries of ours. Returns true if
-/// the document changed.
-fn merge_hooks(root: &mut Map<String, Value>, wanted: &[(&str, Value)]) -> bool {
+/// settings document, dropping any previous entries of ours. Returns whether
+/// the document changed, or an error naming the shape we refused to touch.
+fn merge_hooks(root: &mut Map<String, Value>, wanted: &[(&str, Value)]) -> Result<bool, String> {
     let before = root.get("hooks").cloned();
     let hooks = root
         .entry("hooks".to_string())
         .or_insert_with(|| json!({}));
-    if !hooks.is_object() {
+    let Some(hooks) = hooks.as_object_mut() else {
         // Something unexpected lives there; refuse rather than clobber it.
-        return false;
+        return Err("`hooks` in this file is not an object; left untouched".into());
+    };
+    // Check every event before touching any of them: refusing halfway through
+    // would leave the document merged for the events we already passed.
+    for (event, _) in wanted {
+        if hooks.get(*event).is_some_and(|v| !v.is_array()) {
+            return Err(format!(
+                "`hooks.{event}` in this file is not an array; left untouched"
+            ));
+        }
     }
-    let hooks = hooks.as_object_mut().expect("checked is_object");
     for (event, ours) in wanted {
         let arr = hooks
             .entry((*event).to_string())
             .or_insert_with(|| json!([]));
-        if !arr.is_array() {
-            *arr = json!([]);
-        }
-        let arr = arr.as_array_mut().expect("checked is_array");
+        let arr = arr.as_array_mut().expect("checked above");
         arr.retain(|e| !entry_is_ours(e));
         arr.push(ours.clone());
     }
-    Some(&*hooks) != before.as_ref().and_then(Value::as_object)
+    Ok(Some(&*hooks) != before.as_ref().and_then(Value::as_object))
 }
 
 /// Are all of `wanted`'s events already served by an entry of ours whose
@@ -317,8 +322,8 @@ fn install_json(path: &Path, wanted: &[(&str, Value)]) -> Result<&'static str, S
         return Ok("unchanged");
     }
     let existed = hooks_present(&doc, wanted);
-    if !merge_hooks(&mut doc, wanted) && !existed {
-        return Err("`hooks` in this file is not an object; left untouched".into());
+    if !merge_hooks(&mut doc, wanted)? {
+        return Ok("unchanged");
     }
     write_json(path, &doc)?;
     Ok(if existed { "updated" } else { "installed" })
@@ -585,6 +590,37 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         assert!(install_json(&path, &claude_wanted()).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+    }
+
+    /// An event key holding something other than an array is a shape we don't
+    /// understand — a hand-written entry, or a schema we haven't seen. Refuse
+    /// it the way a non-object `hooks` is refused, rather than dropping it.
+    #[test]
+    fn non_array_event_is_refused_not_clobbered() {
+        let dir = tmp("nonarray");
+        let path = dir.join("settings.json");
+        let original = r#"{"hooks":{"PreToolUse":{"matcher":"Bash","hooks":[{"type":"command","command":"audit.sh"}]}}}"#;
+        std::fs::write(&path, original).unwrap();
+
+        assert!(install_json(&path, &claude_wanted()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// A bad shape under a *later* event still refuses the whole file — the
+    /// events before it must not be written on their own. (The pre-validation
+    /// pass in `merge_hooks` is what guarantees this; today `install_json`
+    /// would also drop the half-merged document on the `?`, so this pins the
+    /// behaviour against a future refactor that writes incrementally.)
+    #[test]
+    fn a_bad_later_event_refuses_the_whole_file() {
+        let dir = tmp("partial");
+        let path = dir.join("settings.json");
+        // UserPromptSubmit is merged before Stop is reached.
+        let original = r#"{"hooks":{"UserPromptSubmit":[],"Stop":"nope"}}"#;
+        std::fs::write(&path, original).unwrap();
+
+        assert!(install_json(&path, &claude_wanted()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
