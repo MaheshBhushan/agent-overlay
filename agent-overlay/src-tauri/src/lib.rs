@@ -20,6 +20,12 @@ pub fn discover_sessions() -> Vec<tmux::AgentSession> {
     sessions.extend(procscan::discover(&pane_pids));
     for s in &mut sessions {
         if let Some(status) = hooks::override_for(&s.pane_id, &s.cwd) {
+            // Note this discards the *value* only. hooks::record has already
+            // overwritten the map entry by the time we get here, which is what
+            // ends a sticky approval — see hookinstall::claude_wanted. Skipping
+            // the hook for claude to "save" the work would put the card back in
+            // Needs Approval for half an hour.
+            //
             // For claude, running/idle already comes from its authoritative
             // per-pid session file (procscan/tmux). We no longer install hooks
             // that report those (see hookinstall::claude_wanted), but the guard

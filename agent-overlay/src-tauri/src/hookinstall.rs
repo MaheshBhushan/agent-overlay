@@ -33,11 +33,13 @@ use std::path::{Path, PathBuf};
 /// "installed, but an older version".
 ///
 /// 2: the exe path in command hooks is single-quoted on unix, and claude
-/// installs `Notification` only. Existing installs carry the old double-quoted
-/// command and the three retired events; first run short-circuits on the
-/// stamp, so without a bump neither would be corrected for anyone already set
-/// up.
-pub const HOOKS_VERSION: &str = "2";
+/// stopped installing `UserPromptSubmit`/`PreToolUse`/`Stop`.
+/// 3: `PreToolUse` and `Stop` are back — they are what end a sticky approval,
+/// which 2 broke.
+///
+/// First run short-circuits on the stamp, so each of those needed a bump to
+/// reach anyone already set up.
+pub const HOOKS_VERSION: &str = "3";
 
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode-plugin.ts");
 const PI_EXTENSION: &str = include_str!("../../hooks/pi-extension.ts");
@@ -329,19 +331,35 @@ fn claude_path() -> Option<PathBuf> {
 
 /// UserPromptSubmit/PreToolUse → running, Notification → permission,
 /// Stop → idle.
-/// Only `Notification`. Claude's running/idle come from its own per-pid session
-/// file, which is authoritative and can tell two sessions in one folder apart —
-/// so `discover_sessions` discards hook-reported running/idle for claude, and
-/// installing `UserPromptSubmit`/`PreToolUse`/`Stop` meant spawning a process
-/// on every prompt and every tool call to produce a value that was always
-/// dropped. Approval is the one state that file can't report.
+/// `Notification` reports the approval; `PreToolUse` and `Stop` end it.
+///
+/// Claude's running/idle come from its own per-pid session file, which is
+/// authoritative, so `discover_sessions` throws away hook-reported running/idle
+/// for claude — which made these two look like pure overhead. They aren't. A
+/// permission entry is sticky for half an hour, and recording *any* newer event
+/// for that session is what replaces it, whatever `discover_sessions` then does
+/// with the value. So these are not status hooks here, they are the signal that
+/// an approval has been answered:
+///
+/// * `PreToolUse` — the approved tool is running. Clears immediately, which is
+///   the common case.
+/// * `Stop` — the turn ended. Covers the approval being *denied*, or answered
+///   by a turn that runs no further tool, where `PreToolUse` never fires and
+///   the card would otherwise sit in Needs Approval for the full 30 minutes.
+///
+/// `UserPromptSubmit` stays retired: every turn it starts ends in a `Stop`, so
+/// it can only clear an entry one of the two above already would.
 fn claude_wanted() -> Result<Vec<(&'static str, Value)>, String> {
-    Ok(vec![("Notification", entry(notify_command()?))])
+    Ok(vec![
+        ("PreToolUse", entry(event_command("running")?)),
+        ("Notification", entry(notify_command()?)),
+        ("Stop", entry(event_command("idle")?)),
+    ])
 }
 
 /// Events earlier versions installed into. Our entries there are removed on
 /// the next install rather than left as litter in the user's settings.
-const CLAUDE_RETIRED: &[&str] = &["UserPromptSubmit", "PreToolUse", "Stop"];
+const CLAUDE_RETIRED: &[&str] = &["UserPromptSubmit"];
 
 fn codex_path() -> Option<PathBuf> {
     Some(home()?.join(".codex").join("hooks").join("hooks.json"))
@@ -766,12 +784,9 @@ mod tests {
             "updated"
         );
         let doc = read_json_object(&path).unwrap();
-        // Stop is retired, so the legacy payload is removed and the now-empty
-        // event goes with it rather than being replaced by one of ours.
-        assert!(
-            doc["hooks"].get("Stop").is_none(),
-            "legacy entry left behind"
-        );
+        let stop = doc["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "legacy entry doubled instead of replaced");
+        assert!(is_ours(stop[0]["hooks"][0]["command"].as_str().unwrap()));
     }
 
     /// Earlier versions installed running/idle hooks for claude that
@@ -784,12 +799,12 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"hooks":{
-                 "PreToolUse":[
+                 "UserPromptSubmit":[
                    {"hooks":[{"type":"command","command":"\"/old/agent-overlay\" --hook-event running"}]},
                    {"hooks":[{"type":"command","command":"python3 audit.py"}]}
                  ],
-                 "Stop":[
-                   {"hooks":[{"type":"command","command":"\"/old/agent-overlay\" --hook-event idle"}]}
+                 "SessionEnd":[
+                   {"hooks":[{"type":"command","command":"python3 bye.py"}]}
                  ]
                }}"#,
         )
@@ -800,17 +815,33 @@ mod tests {
             "updated"
         );
         let doc = read_json_object(&path).unwrap();
-        // Ours are gone; Stop held nothing else, so the key goes too.
-        assert!(doc["hooks"].get("Stop").is_none());
-        // Theirs is untouched, and keeps its event.
-        let pre = doc["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre.len(), 1);
-        assert_eq!(pre[0]["hooks"][0]["command"], json!("python3 audit.py"));
+        // Ours is gone from the retired event; theirs stays, so the key stays.
+        let ups = doc["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0]["hooks"][0]["command"], json!("python3 audit.py"));
+        // An event we never touch is untouched.
+        assert_eq!(
+            doc["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+            json!("python3 bye.py")
+        );
         // And a second run is a no-op.
         assert_eq!(
             install_json(&path, &claude_wanted().unwrap(), CLAUDE_RETIRED).unwrap(),
             "unchanged"
         );
+
+        // When ours was the only entry there, the event goes with it rather
+        // than being left behind empty.
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"UserPromptSubmit":[
+                 {"hooks":[{"type":"command","command":"\"/old/agent-overlay\" --hook-event running"}]}
+               ]}}"#,
+        )
+        .unwrap();
+        install_json(&path, &claude_wanted().unwrap(), CLAUDE_RETIRED).unwrap();
+        let doc = read_json_object(&path).unwrap();
+        assert!(doc["hooks"].get("UserPromptSubmit").is_none());
     }
 
     /// A settings.json we can't parse must be reported, never overwritten.
