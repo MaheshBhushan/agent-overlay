@@ -299,13 +299,28 @@ fn file_state(path: &Path, payload: &str) -> (bool, bool) {
 }
 
 fn install_file(path: &Path, payload: &str) -> Result<&'static str, String> {
-    let (current, _) = file_state(path, payload);
+    let (current, ours) = file_state(path, payload);
     if current {
         return Ok("unchanged");
     }
     let existed = path.exists();
+    if existed && !ours {
+        // Same name, someone else's file. We don't own it, so we don't replace
+        // it — this runs unattended on first launch.
+        return Err(format!(
+            "{} exists and was not written by agent-overlay; left untouched",
+            path.display()
+        ));
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    if existed {
+        let bak = path.with_extension("ts.agent-overlay.bak");
+        if !bak.exists() {
+            std::fs::copy(path, &bak)
+                .map_err(|e| format!("cannot back up {}: {e}", path.display()))?;
+        }
     }
     std::fs::write(path, payload).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(if existed { "updated" } else { "installed" })
@@ -615,6 +630,40 @@ mod tests {
         std::fs::write(&path, "// agent-overlay hooks v0\n").unwrap();
         assert_eq!(file_state(&path, OPENCODE_PLUGIN), (false, true));
         assert_eq!(install_file(&path, OPENCODE_PLUGIN).unwrap(), "updated");
+    }
+
+    /// Same filename, someone else's file. We don't own it, so we don't get to
+    /// replace it — this one runs unattended on first launch.
+    #[test]
+    fn a_foreign_file_is_never_overwritten() {
+        let dir = tmp("foreign");
+        let path = dir.join("plugin").join("agent-overlay.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let theirs = "export const mine = () => console.log('not ours')\n";
+        std::fs::write(&path, theirs).unwrap();
+
+        assert!(install_file(&path, OPENCODE_PLUGIN).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+    }
+
+    /// README promises a `.bak` before the first edit for every target, not
+    /// just the merged JSON ones.
+    #[test]
+    fn replacing_our_own_file_backs_it_up_once() {
+        let dir = tmp("filebak");
+        let path = dir.join("plugin").join("agent-overlay.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = "// agent-overlay hooks v0\n";
+        std::fs::write(&path, old).unwrap();
+
+        assert_eq!(install_file(&path, OPENCODE_PLUGIN).unwrap(), "updated");
+        let bak = path.with_extension("ts.agent-overlay.bak");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), old);
+
+        // A later upgrade must not overwrite the pristine backup.
+        std::fs::write(&path, "// agent-overlay hooks v0.5\n").unwrap();
+        assert_eq!(install_file(&path, OPENCODE_PLUGIN).unwrap(), "updated");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), old);
     }
 
     /// Quoting is the whole reason command hooks broke on Windows.

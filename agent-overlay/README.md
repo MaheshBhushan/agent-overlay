@@ -56,7 +56,7 @@ A fresh hook event overrides the scraped status for that session (`running`/`idl
 | opencode | `~/.config/opencode/plugin/agent-overlay.ts` | `permission.ask` — exact |
 | pi | `~/.pi/agent/extensions/agent-overlay.ts` | none — pi exposes no approval event, so approvals stay scraped |
 
-Installation is **idempotent and non-destructive**: only hook entries the overlay recognises as its own are ever replaced, everything else in those files is preserved, and the original is copied to `<name>.agent-overlay.bak` before the first edit. An unparseable config is reported and left untouched. Uninstalling the overlay leaves the hooks in place — they are inert without it running.
+Installation is **idempotent and non-destructive**: only hook entries the overlay recognises as its own are ever replaced, everything else in those files is preserved, and the original is copied to `<name>.agent-overlay.bak` before the first edit. An unparseable config is reported and left untouched, as is a file already sitting at one of the plugin paths that the overlay did not write. Uninstalling the overlay leaves the hooks in place — they are inert without it running.
 
 Command hooks (Claude, codex) invoke the overlay binary — `agent-overlay --hook-event running` — rather than `curl`. That keeps one hook command working under both `sh` and `cmd.exe`; the older hand-merged curl payload used `$TMUX_PANE`, `$PWD`, single-quoted headers and `payload=$(cat)`, none of which `cmd.exe` honours, so **it silently did nothing on Windows**. If you have that payload in your settings, installing replaces it. [`hooks/claude-code-settings.example.json`](hooks/claude-code-settings.example.json) remains for reference only.
 
