@@ -21,11 +21,12 @@ pub fn discover_sessions() -> Vec<tmux::AgentSession> {
     for s in &mut sessions {
         if let Some(status) = hooks::override_for(&s.pane_id, &s.cwd) {
             // For claude, running/idle already comes from its authoritative
-            // per-pid session file (procscan/tmux). A hook keyed only on cwd
-            // (non-tmux sessions send no pane id) can't tell two claude
-            // sessions in one folder apart, so honouring its running/idle would
-            // flip an idle sibling whenever the other works. Take only the one
-            // state the status file lacks — permission (awaiting approval).
+            // per-pid session file (procscan/tmux). We no longer install hooks
+            // that report those (see hookinstall::claude_wanted), but the guard
+            // stays: the cwd fallback key is not namespaced by agent, so an
+            // opencode or pi session working in the same folder would otherwise
+            // hand its running/idle to a claude session sitting next to it.
+            // Take only the one state the status file lacks — permission.
             if s.agent == "claude" && status != "permission" {
                 continue;
             }

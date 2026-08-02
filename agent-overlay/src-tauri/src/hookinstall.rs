@@ -31,7 +31,11 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when a payload changes, so an upgrade can tell "installed" from
 /// "installed, but an older version".
-pub const HOOKS_VERSION: &str = "1";
+///
+/// 2: claude installs `Notification` only. Existing installs carry the three
+/// retired events, and first run short-circuits on the stamp — without a bump
+/// the cleanup below would never run for anyone already set up.
+pub const HOOKS_VERSION: &str = "2";
 
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode-plugin.ts");
 const PI_EXTENSION: &str = include_str!("../../hooks/pi-extension.ts");
@@ -126,7 +130,7 @@ fn entry_is_ours(v: &Value) -> bool {
 /// Merge `wanted` (event name → our entry) into the `hooks` object of a
 /// settings document, dropping any previous entries of ours. Returns true if
 /// the document changed.
-fn merge_hooks(root: &mut Map<String, Value>, wanted: &[(&str, Value)]) -> bool {
+fn merge_hooks(root: &mut Map<String, Value>, wanted: &[(&str, Value)], retire: &[&str]) -> bool {
     let before = root.get("hooks").cloned();
     let hooks = root
         .entry("hooks".to_string())
@@ -147,32 +151,59 @@ fn merge_hooks(root: &mut Map<String, Value>, wanted: &[(&str, Value)]) -> bool 
         arr.retain(|e| !entry_is_ours(e));
         arr.push(ours.clone());
     }
+    // Events we used to install into: drop our entries so an upgrade doesn't
+    // leave them behind, and take the key with them if nothing else is there.
+    // This runs after the merge above, so an event in both lists would have the
+    // entry we just wrote deleted again and rewrite the file on every install.
+    debug_assert!(
+        !retire.iter().any(|r| wanted.iter().any(|(w, _)| w == r)),
+        "an event cannot be both wanted and retired"
+    );
+    for event in retire {
+        let Some(arr) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        arr.retain(|e| !entry_is_ours(e));
+        if arr.is_empty() {
+            hooks.remove(*event);
+        }
+    }
     Some(&*hooks) != before.as_ref().and_then(Value::as_object)
 }
 
 /// Are all of `wanted`'s events already served by an entry of ours whose
 /// command matches exactly? (Exact match is what makes an upgrade with a new
 /// exe path register as "outdated" rather than "installed".)
-fn hooks_current(root: &Map<String, Value>, wanted: &[(&str, Value)]) -> bool {
+fn hooks_current(root: &Map<String, Value>, wanted: &[(&str, Value)], retire: &[&str]) -> bool {
     let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
         return false;
     };
-    wanted.iter().all(|(event, ours)| {
+    let leftovers = retire.iter().any(|event| {
         hooks
             .get(*event)
             .and_then(Value::as_array)
-            .is_some_and(|arr| arr.contains(ours))
-    })
+            .is_some_and(|arr| arr.iter().any(entry_is_ours))
+    });
+    !leftovers
+        && wanted.iter().all(|(event, ours)| {
+            hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .is_some_and(|arr| arr.contains(ours))
+        })
 }
 
-/// Any of ours present at all, current or not.
-fn hooks_present(root: &Map<String, Value>, wanted: &[(&str, Value)]) -> bool {
+/// Any of ours present at all, current or not — including under events we have
+/// since retired, so removing those still reports as an update rather than a
+/// fresh install.
+fn hooks_present(root: &Map<String, Value>, wanted: &[(&str, Value)], retire: &[&str]) -> bool {
     root.get("hooks")
         .and_then(Value::as_object)
         .is_some_and(|hooks| {
-            wanted.iter().any(|(event, _)| {
+            let events = wanted.iter().map(|(e, _)| *e).chain(retire.iter().copied());
+            events.into_iter().any(|event| {
                 hooks
-                    .get(*event)
+                    .get(event)
                     .and_then(Value::as_array)
                     .is_some_and(|arr| arr.iter().any(entry_is_ours))
             })
@@ -214,16 +245,19 @@ fn claude_path() -> Option<PathBuf> {
     Some(home()?.join(".claude").join("settings.json"))
 }
 
-/// UserPromptSubmit/PreToolUse → running, Notification → permission,
-/// Stop → idle.
+/// Only `Notification`. Claude's running/idle come from its own per-pid session
+/// file, which is authoritative and can tell two sessions in one folder apart —
+/// so `discover_sessions` discards hook-reported running/idle for claude, and
+/// installing `UserPromptSubmit`/`PreToolUse`/`Stop` meant spawning a process
+/// on every prompt and every tool call to produce a value that was always
+/// dropped. Approval is the one state that file can't report.
 fn claude_wanted() -> Vec<(&'static str, Value)> {
-    vec![
-        ("UserPromptSubmit", entry(event_command("running"))),
-        ("PreToolUse", entry(event_command("running"))),
-        ("Notification", entry(notify_command())),
-        ("Stop", entry(event_command("idle"))),
-    ]
+    vec![("Notification", entry(notify_command()))]
 }
+
+/// Events earlier versions installed into. Our entries there are removed on
+/// the next install rather than left as litter in the user's settings.
+const CLAUDE_RETIRED: &[&str] = &["UserPromptSubmit", "PreToolUse", "Stop"];
 
 fn codex_path() -> Option<PathBuf> {
     Some(home()?.join(".codex").join("hooks").join("hooks.json"))
@@ -311,13 +345,17 @@ fn install_file(path: &Path, payload: &str) -> Result<&'static str, String> {
     Ok(if existed { "updated" } else { "installed" })
 }
 
-fn install_json(path: &Path, wanted: &[(&str, Value)]) -> Result<&'static str, String> {
+fn install_json(
+    path: &Path,
+    wanted: &[(&str, Value)],
+    retire: &[&str],
+) -> Result<&'static str, String> {
     let mut doc = read_json_object(path)?;
-    if hooks_current(&doc, wanted) {
+    if hooks_current(&doc, wanted, retire) {
         return Ok("unchanged");
     }
-    let existed = hooks_present(&doc, wanted);
-    if !merge_hooks(&mut doc, wanted) && !existed {
+    let existed = hooks_present(&doc, wanted, retire);
+    if !merge_hooks(&mut doc, wanted, retire) && !existed {
         return Err("`hooks` in this file is not an object; left untouched".into());
     }
     write_json(path, &doc)?;
@@ -338,13 +376,13 @@ pub fn status() -> Vec<CliHooks> {
             .as_deref()
             .and_then(|p| read_json_object(p).ok())
             .unwrap_or_default();
-        let installed = hooks_current(&doc, &wanted);
+        let installed = hooks_current(&doc, &wanted, CLAUDE_RETIRED);
         out.push(CliHooks {
             id: "claude",
             name: "Claude Code",
             present: cli_present(path.clone().map(|p| p.with_file_name("")), "claude"),
             installed,
-            outdated: !installed && hooks_present(&doc, &wanted),
+            outdated: !installed && hooks_present(&doc, &wanted, CLAUDE_RETIRED),
             path: path.map(|p| p.display().to_string()).unwrap_or_default(),
             exact_approval: true,
             note: "approvals only fire when permission mode isn't auto-accept".into(),
@@ -359,13 +397,13 @@ pub fn status() -> Vec<CliHooks> {
             .as_deref()
             .and_then(|p| read_json_object(p).ok())
             .unwrap_or_default();
-        let installed = hooks_current(&doc, &wanted);
+        let installed = hooks_current(&doc, &wanted, &[]);
         out.push(CliHooks {
             id: "codex",
             name: "OpenAI Codex CLI",
             present: cli_present(home().map(|h| h.join(".codex")), "codex"),
             installed,
-            outdated: !installed && hooks_present(&doc, &wanted),
+            outdated: !installed && hooks_present(&doc, &wanted, &[]),
             path: path.map(|p| p.display().to_string()).unwrap_or_default(),
             exact_approval: true,
             note: "no turn-end event: idle falls back to scraping".into(),
@@ -427,11 +465,11 @@ pub fn install_all() -> Vec<InstallOutcome> {
         } else {
             match cli.id {
                 "claude" => match claude_path() {
-                    Some(p) => install_json(&p, &claude_wanted()),
+                    Some(p) => install_json(&p, &claude_wanted(), CLAUDE_RETIRED),
                     None => Err("no home directory".into()),
                 },
                 "codex" => match codex_path() {
-                    Some(p) => install_json(&p, &codex_wanted()),
+                    Some(p) => install_json(&p, &codex_wanted(), &[]),
                     None => Err("no home directory".into()),
                 },
                 "opencode" => match opencode_path() {
@@ -503,13 +541,19 @@ mod tests {
                 ],
                 "SessionEnd": [
                   {"hooks":[{"type":"command","command":"python3 bye.py"}]}
+                ],
+                "Notification": [
+                  {"hooks":[{"type":"command","command":"python3 notify.py"}]}
                 ]
               }
             }"#,
         )
         .unwrap();
 
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "installed");
+        assert_eq!(
+            install_json(&path, &claude_wanted(), CLAUDE_RETIRED).unwrap(),
+            "installed"
+        );
 
         let doc = read_json_object(&path).unwrap();
         assert_eq!(doc["model"], json!("opus"));
@@ -519,21 +563,32 @@ mod tests {
             hooks["SessionEnd"][0]["hooks"][0]["command"],
             json!("python3 bye.py")
         );
-        let ups = hooks["UserPromptSubmit"].as_array().unwrap();
-        assert_eq!(ups.len(), 2, "ours appended, theirs kept");
-        assert_eq!(ups[0]["hooks"][0]["command"], json!("python3 recall.py"));
-        assert!(is_ours(ups[1]["hooks"][0]["command"].as_str().unwrap()));
+        // A foreign entry under an event we have retired is still theirs.
+        assert_eq!(
+            hooks["UserPromptSubmit"][0]["hooks"][0]["command"],
+            json!("python3 recall.py")
+        );
+        let notif = hooks["Notification"].as_array().unwrap();
+        assert_eq!(notif.len(), 2, "ours appended, theirs kept");
+        assert_eq!(notif[0]["hooks"][0]["command"], json!("python3 notify.py"));
+        assert!(is_ours(notif[1]["hooks"][0]["command"].as_str().unwrap()));
     }
 
     #[test]
     fn install_is_idempotent() {
         let dir = tmp("idempotent");
         let path = dir.join("settings.json");
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "installed");
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "unchanged");
+        assert_eq!(
+            install_json(&path, &claude_wanted(), CLAUDE_RETIRED).unwrap(),
+            "installed"
+        );
+        assert_eq!(
+            install_json(&path, &claude_wanted(), CLAUDE_RETIRED).unwrap(),
+            "unchanged"
+        );
         let doc = read_json_object(&path).unwrap();
-        assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
-        assert!(hooks_current(&doc, &claude_wanted()));
+        assert_eq!(doc["hooks"]["Notification"].as_array().unwrap().len(), 1);
+        assert!(hooks_current(&doc, &claude_wanted(), CLAUDE_RETIRED));
     }
 
     /// An upgrade moves the exe; the stale entry must be replaced, not doubled.
@@ -543,20 +598,23 @@ mod tests {
         let path = dir.join("settings.json");
         std::fs::write(
             &path,
-            r#"{"hooks":{"PreToolUse":[
-                 {"hooks":[{"type":"command","command":"\"/old/path/agent-overlay\" --hook-event running"}]}
+            r#"{"hooks":{"Notification":[
+                 {"hooks":[{"type":"command","command":"\"/old/path/agent-overlay\" --hook-notify"}]}
                ]}}"#,
         )
         .unwrap();
         let doc = read_json_object(&path).unwrap();
-        assert!(hooks_present(&doc, &claude_wanted()));
-        assert!(!hooks_current(&doc, &claude_wanted()));
+        assert!(hooks_present(&doc, &claude_wanted(), CLAUDE_RETIRED));
+        assert!(!hooks_current(&doc, &claude_wanted(), CLAUDE_RETIRED));
 
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "updated");
+        assert_eq!(
+            install_json(&path, &claude_wanted(), CLAUDE_RETIRED).unwrap(),
+            "updated"
+        );
         let doc = read_json_object(&path).unwrap();
-        let arr = doc["hooks"]["PreToolUse"].as_array().unwrap();
+        let arr = doc["hooks"]["Notification"].as_array().unwrap();
         assert_eq!(arr.len(), 1, "stale entry replaced");
-        assert!(hooks_current(&doc, &claude_wanted()));
+        assert!(hooks_current(&doc, &claude_wanted(), CLAUDE_RETIRED));
     }
 
     /// The hand-merged curl payload from the README is ours to retire — it is
@@ -572,9 +630,53 @@ mod tests {
             format!(r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{curl}"}}]}}]}}}}"#),
         )
         .unwrap();
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "updated");
+        assert_eq!(
+            install_json(&path, &claude_wanted(), CLAUDE_RETIRED).unwrap(),
+            "updated"
+        );
         let doc = read_json_object(&path).unwrap();
-        assert_eq!(doc["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        // Stop is retired, so the legacy payload is removed and the now-empty
+        // event goes with it rather than being replaced by one of ours.
+        assert!(doc["hooks"].get("Stop").is_none(), "legacy entry left behind");
+    }
+
+    /// Earlier versions installed running/idle hooks for claude that
+    /// discover_sessions always discarded. Upgrading must take our own entries
+    /// back out rather than leave them running a process per tool call.
+    #[test]
+    fn retired_claude_hooks_are_removed_on_upgrade() {
+        let dir = tmp("retire");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{
+                 "PreToolUse":[
+                   {"hooks":[{"type":"command","command":"\"/old/agent-overlay\" --hook-event running"}]},
+                   {"hooks":[{"type":"command","command":"python3 audit.py"}]}
+                 ],
+                 "Stop":[
+                   {"hooks":[{"type":"command","command":"\"/old/agent-overlay\" --hook-event idle"}]}
+                 ]
+               }}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            install_json(&path, &claude_wanted(), CLAUDE_RETIRED).unwrap(),
+            "updated"
+        );
+        let doc = read_json_object(&path).unwrap();
+        // Ours are gone; Stop held nothing else, so the key goes too.
+        assert!(doc["hooks"].get("Stop").is_none());
+        // Theirs is untouched, and keeps its event.
+        let pre = doc["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0]["hooks"][0]["command"], json!("python3 audit.py"));
+        // And a second run is a no-op.
+        assert_eq!(
+            install_json(&path, &claude_wanted(), CLAUDE_RETIRED).unwrap(),
+            "unchanged"
+        );
     }
 
     /// A settings.json we can't parse must be reported, never overwritten.
@@ -583,7 +685,7 @@ mod tests {
         let dir = tmp("garbage");
         let path = dir.join("settings.json");
         std::fs::write(&path, "{not json").unwrap();
-        assert!(install_json(&path, &claude_wanted()).is_err());
+        assert!(install_json(&path, &claude_wanted(), CLAUDE_RETIRED).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
     }
 
@@ -592,13 +694,13 @@ mod tests {
         let dir = tmp("backup");
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
-        install_json(&path, &claude_wanted()).unwrap();
+        install_json(&path, &claude_wanted(), CLAUDE_RETIRED).unwrap();
         let bak = path.with_extension("json.agent-overlay.bak");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), r#"{"model":"opus"}"#);
 
         // A later install must not overwrite the pristine backup.
         std::fs::write(&path, r#"{"model":"changed"}"#).unwrap();
-        install_json(&path, &claude_wanted()).unwrap();
+        install_json(&path, &claude_wanted(), CLAUDE_RETIRED).unwrap();
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), r#"{"model":"opus"}"#);
     }
 
