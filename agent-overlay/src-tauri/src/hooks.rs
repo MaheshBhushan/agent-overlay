@@ -4,9 +4,13 @@
 //! body like `{"status":"running","pane":"%3","cwd":"/home/me/proj"}`.
 //! Agent CLIs that support hooks (e.g. Claude Code's Notification hook, or
 //! opencode's tool/permission events) report an event on each transition,
-//! giving exact, instant status. Events are stored per pane (and per cwd as
-//! a fallback for non-tmux sessions) and override the scraped status while
-//! fresh; scraping remains the source of truth for agents without hooks.
+//! giving exact, instant status. An event is filed against whatever names one
+//! session — the tmux pane id, or the reporting hook's ancestor pids, which is
+//! how a session outside tmux is named. `cwd` is the last resort, used only
+//! when neither is available, because two agents working in one folder is
+//! normal and a shared key would put them all in the same state. Events
+//! override the scraped status while fresh; scraping remains the source of
+//! truth for agents without hooks.
 //!
 //! The same socket doubles as the single-instance lock. Exactly one overlay can
 //! hold 127.0.0.1:8377, so a failed bind means either another overlay is already
@@ -38,6 +42,11 @@ struct HookEvent {
     status: String,
     pane: Option<String>,
     cwd: Option<String>,
+    /// The reporting hook's ancestor pids. The agent is among them, and
+    /// `pid:{p}` is exactly how procscan keys a session outside tmux, so this
+    /// lands the event on one session instead of every session in a folder.
+    #[serde(default)]
+    pids: Vec<u32>,
 }
 
 struct Entry {
@@ -47,19 +56,27 @@ struct Entry {
 
 static STATE: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
 
-fn record(status: &str, pane: Option<&str>, cwd: Option<&str>) {
+fn record(status: &str, pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) {
     if !matches!(status, "running" | "idle" | "permission") {
         return;
     }
+    let pane = pane.filter(|p| !p.is_empty()).map(str::to_string);
+    // A pane id or a pid names one session. `cwd` names a folder, and two
+    // agents working in one folder are a normal thing to do — so it is the
+    // last resort, used only when nothing precise is available. Writing it
+    // alongside a precise key is what used to put an idle sibling in the
+    // Needs Approval column next to the session actually waiting.
+    let precise = pane.is_some() || !pids.is_empty();
     let mut guard = STATE.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
     let now = Instant::now();
-    for key in [
-        pane.filter(|p| !p.is_empty()).map(str::to_string),
-        cwd.filter(|c| !c.is_empty()).map(|c| format!("cwd:{c}")),
-    ]
-    .into_iter()
-    .flatten()
+    for key in pane
+        .into_iter()
+        .chain(pids.iter().map(|p| format!("pid:{p}")))
+        .chain(
+            cwd.filter(|c| !c.is_empty() && !precise)
+                .map(|c| format!("cwd:{c}")),
+        )
     {
         map.insert(
             key,
@@ -107,12 +124,56 @@ pub fn post_event(status: &str) {
     post_event_to(PORT, status);
 }
 
+/// The pids between us and the agent that ran this hook. A command hook runs as
+/// `agent -> sh -> agent-overlay`, so the agent's own pid is a couple of steps
+/// up, and procscan keys a non-tmux session by exactly that pid.
+///
+/// Linux only: it is a few small reads under /proc, which a hook can afford.
+/// Elsewhere this is empty and the cwd fallback still applies, so nothing
+/// breaks — it just stays as imprecise as it is today.
+#[cfg(target_os = "linux")]
+fn ancestor_pids() -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut pid = std::process::id();
+    // Deep enough to clear the shell and any wrapper, bounded so a cycle or a
+    // pid-reuse oddity can never spin a hook.
+    for _ in 0..8 {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            break;
+        };
+        let Some(ppid) = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        else {
+            break;
+        };
+        if ppid <= 1 {
+            break;
+        }
+        out.push(ppid);
+        pid = ppid;
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ancestor_pids() -> Vec<u32> {
+    Vec::new()
+}
+
 fn post_event_to(port: u16, status: &str) {
     let pane = std::env::var("TMUX_PANE").unwrap_or_default();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let body = serde_json::json!({ "status": status, "pane": pane, "cwd": cwd }).to_string();
+    let body = serde_json::json!({
+        "status": status,
+        "pane": pane,
+        "cwd": cwd,
+        "pids": ancestor_pids(),
+    })
+    .to_string();
 
     let timeout = Duration::from_secs(2);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -209,7 +270,7 @@ fn handle(stream: TcpStream, on_show: &dyn Fn()) -> Option<()> {
     let show = path == "/show" && method.eq_ignore_ascii_case("POST") && !from_browser;
     if path != "/show" && !from_browser {
         if let Ok(ev) = serde_json::from_slice::<HookEvent>(&body) {
-            record(&ev.status, ev.pane.as_deref(), ev.cwd.as_deref());
+            record(&ev.status, ev.pane.as_deref(), ev.cwd.as_deref(), &ev.pids);
         }
     }
     // Answer before showing the window: the caller is waiting on this response
@@ -296,17 +357,58 @@ mod tests {
 
     #[test]
     fn record_and_override_by_pane_and_cwd() {
-        record("permission", Some("%9"), Some("/tmp/proj"));
-        assert_eq!(override_for("%9", "/other").as_deref(), Some("permission"));
+        // No pane and no pids: cwd is all we have, so it is used.
+        record("permission", None, Some("/tmp/proj"), &[]);
         assert_eq!(
             override_for("pid:123", "/tmp/proj").as_deref(),
+            Some("permission")
+        );
+
+        record("permission", Some("%9"), Some("/tmp/other"), &[]);
+        assert_eq!(
+            override_for("%9", "/nowhere").as_deref(),
             Some("permission")
         );
         assert_eq!(override_for("%404", "/nowhere"), None);
 
         // A newer event replaces the sticky permission state.
-        record("running", Some("%9"), Some("/tmp/proj"));
-        assert_eq!(override_for("%9", "/tmp/proj").as_deref(), Some("running"));
+        record("running", Some("%9"), Some("/tmp/other"), &[]);
+        assert_eq!(override_for("%9", "/tmp/other").as_deref(), Some("running"));
+    }
+
+    /// The reported bug: two agents in one folder, one waiting on approval,
+    /// and both cards landing in Needs Approval. An event that names a session
+    /// must not also be filed under the folder every sibling shares.
+    #[test]
+    fn a_sibling_in_the_same_folder_is_not_flagged() {
+        let cwd = "/tmp/shared-project";
+
+        // The tmux session that actually needs approval.
+        record("permission", Some("%21"), Some(cwd), &[]);
+        assert_eq!(override_for("%21", cwd).as_deref(), Some("permission"));
+        assert_eq!(override_for("%22", cwd), None, "sibling pane flagged");
+        assert_eq!(override_for("pid:9001", cwd), None, "sibling pid flagged");
+
+        // And the same for a session outside tmux, named by pid.
+        let cwd2 = "/tmp/shared-two";
+        record("permission", None, Some(cwd2), &[4242]);
+        assert_eq!(
+            override_for("pid:4242", cwd2).as_deref(),
+            Some("permission")
+        );
+        assert_eq!(override_for("pid:4243", cwd2), None, "sibling pid flagged");
+    }
+
+    /// Approving is not itself an event, so the next thing the session does is
+    /// what has to clear the sticky permission — otherwise the card sits in
+    /// Needs Approval for the full 30 minutes after the user has answered.
+    #[test]
+    fn the_next_event_clears_a_sticky_permission() {
+        record("permission", Some("%31"), None, &[]);
+        assert_eq!(override_for("%31", "").as_deref(), Some("permission"));
+        // PreToolUse after the approval.
+        record("running", Some("%31"), None, &[]);
+        assert_eq!(override_for("%31", "").as_deref(), Some("running"));
     }
 
     /// The full `--hook-event` round trip: what an agent CLI's hook actually
@@ -318,10 +420,20 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         serve(listener, || {});
 
+        // The hook reports its ancestors, and procscan names a non-tmux
+        // session `pid:{p}` — so on linux the event lands on this test process
+        // by pid. Elsewhere there are no pids and cwd is still the fallback.
         let cwd = std::env::current_dir().unwrap().display().to_string();
+        let key = if cfg!(target_os = "linux") {
+            let parent = ancestor_pids();
+            assert!(!parent.is_empty(), "no ancestors resolved");
+            format!("pid:{}", parent[0])
+        } else {
+            "no-such-pane".to_string()
+        };
         post_event_to(port, "permission");
         wait_until(
-            || override_for("no-such-pane", &cwd).as_deref() == Some("permission"),
+            || override_for(&key, &cwd).as_deref() == Some("permission"),
             "hook event never reached the listener",
         );
     }
@@ -384,7 +496,7 @@ mod tests {
 
     #[test]
     fn unknown_status_ignored() {
-        record("exploded", Some("%8"), None);
+        record("exploded", Some("%8"), None, &[]);
         assert_eq!(override_for("%8", ""), None);
     }
 
