@@ -162,9 +162,11 @@ fn handle(stream: TcpStream, on_show: &dyn Fn()) -> Option<()> {
     let mut words = line.split_whitespace();
     let method = words.next().unwrap_or("").to_string();
     let path = words.next().unwrap_or("").to_string();
-    // /show manipulates the window, so it must not be reachable from a web page.
-    // A browser cannot suppress Origin/Referer on a cross-origin fetch, and a
-    // simple POST is the only shape that gets through without a preflight.
+    // Neither endpoint may be driven by a web page: /show manipulates the
+    // window, and /event writes the status the user acts on — a forged "idle"
+    // hides a waiting agent. A browser cannot suppress Origin/Referer on a
+    // cross-origin fetch, and a simple POST is the only shape that gets
+    // through without a preflight.
     let mut from_browser = false;
     loop {
         let mut header = String::new();
@@ -186,7 +188,7 @@ fn handle(stream: TcpStream, on_show: &dyn Fn()) -> Option<()> {
     reader.read_exact(&mut body).ok()?;
 
     let show = path == "/show" && method.eq_ignore_ascii_case("POST") && !from_browser;
-    if path != "/show" {
+    if path != "/show" && !from_browser {
         if let Ok(ev) = serde_json::from_slice::<HookEvent>(&body) {
             record(&ev.status, ev.pane.as_deref(), ev.cwd.as_deref());
         }
@@ -360,6 +362,41 @@ mod tests {
         t.join().unwrap();
         assert!(resp.starts_with("HTTP/1.1 204"));
         assert_eq!(override_for("%77", "/tmp/x").as_deref(), Some("idle"));
+    }
+
+    /// A page the user happens to visit can POST here without a preflight, so
+    /// an event carrying Origin/Referer must not be allowed to write status —
+    /// forging "idle" would hide a waiting agent, "permission" would fill the
+    /// Needs Approval column with sessions that want nothing.
+    #[test]
+    fn browser_events_are_ignored() {
+        for header in [
+            "Origin: https://evil.example",
+            "Referer: https://evil.example/x",
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let t = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                handle(stream, &|| {});
+            });
+            let body = r#"{"status":"permission","pane":"%78","cwd":"/tmp/y"}"#;
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                c,
+                "POST /event HTTP/1.1\r\nHost: x\r\n{}\r\nContent-Length: {}\r\n\r\n{}",
+                header,
+                body.len(),
+                body
+            )
+            .unwrap();
+            let mut resp = String::new();
+            c.read_to_string(&mut resp).unwrap();
+            t.join().unwrap();
+            // Answered like any other request: the page learns nothing from it.
+            assert!(resp.starts_with("HTTP/1.1 204"));
+            assert_eq!(override_for("%78", "/tmp/y"), None, "recorded via {header}");
+        }
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};
