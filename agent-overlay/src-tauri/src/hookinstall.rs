@@ -31,7 +31,11 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when a payload changes, so an upgrade can tell "installed" from
 /// "installed, but an older version".
-pub const HOOKS_VERSION: &str = "1";
+///
+/// 2: the exe path in command hooks is single-quoted on unix. Existing installs
+/// carry the old double-quoted command, and the first-run stamp would otherwise
+/// skip replacing it.
+pub const HOOKS_VERSION: &str = "2";
 
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode-plugin.ts");
 const PI_EXTENSION: &str = include_str!("../../hooks/pi-extension.ts");
@@ -74,24 +78,65 @@ fn home() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-/// The command a hook should run to report `status`. Quoted so a path with
-/// spaces survives both `sh -c` and `cmd /c` — the Windows default install
-/// location (`…\Program Files\…`, `…\AppData\Local\…`) always has one.
-fn event_command(status: &str) -> String {
+/// Quote the exe path for the shell the hooks system runs the command in.
+///
+/// Under `sh -c`, double quotes still expand `$(…)`, `` ` `` and `\`, so a
+/// binary under a path someone else chose — an extracted archive, a checkout
+/// directory — would run their text on every prompt and tool call. The command
+/// is persisted into the user's settings.json, so it outlives the overlay.
+/// Single quotes are exact: nothing inside them is special, and an embedded
+/// quote is closed, escaped and reopened.
+#[cfg(not(windows))]
+fn quote_exe(path: &str) -> Result<String, String> {
+    Ok(format!("'{}'", path.replace('\'', r"'\''")))
+}
+
+/// `cmd.exe` has no equivalent of sh's single quotes, and worse, it expands
+/// `%VAR%` *before* it parses quotes and then re-parses the substituted text.
+/// The filename can't contain a `"`, but the variable's value can — so
+/// `C:\…\%FOO%\agent-overlay.exe` with `FOO` set to `" & calc.exe & "` closes
+/// our quoted string and runs a second command, on every prompt and tool call.
+/// That is the parse order behind CVE-2024-24576, and there is no escape for
+/// `%` on a command line.
+///
+/// So: keep the double quotes, which do cover the spaces every default install
+/// location has and do neutralise `& | < > ^` in the literal path, and refuse
+/// outright when the path contains a `%` we cannot make safe.
+/// Split out from the `#[cfg(windows)]` path so the decision is testable on
+/// any host — the quoting itself can only be exercised on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cmd_would_expand(path: &str) -> bool {
+    path.contains('%')
+}
+
+#[cfg(windows)]
+fn quote_exe(path: &str) -> Result<String, String> {
+    if cmd_would_expand(path) {
+        return Err(format!(
+            "cmd.exe would expand the '%' in {path}; move the binary somewhere \
+             without one and install hooks again"
+        ));
+    }
+    Ok(format!("\"{path}\""))
+}
+
+/// The command a hook should run to report `status`.
+fn event_command(status: &str) -> Result<String, String> {
+    Ok(format!("{} --hook-event {status}", quoted_exe()?))
+}
+
+fn quoted_exe() -> Result<String, String> {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "agent-overlay".into());
-    format!("\"{exe}\" --hook-event {status}")
+    quote_exe(&exe)
 }
 
 /// Claude's `Notification` hook fires for more than approvals, so the decision
 /// needs the event payload on stdin. `--hook-notify` reads it and posts only
 /// when it is a permission request.
-fn notify_command() -> String {
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "agent-overlay".into());
-    format!("\"{exe}\" --hook-notify")
+fn notify_command() -> Result<String, String> {
+    Ok(format!("{} --hook-notify", quoted_exe()?))
 }
 
 /// Is this hook command one of ours (so it may be replaced)?
@@ -216,13 +261,13 @@ fn claude_path() -> Option<PathBuf> {
 
 /// UserPromptSubmit/PreToolUse → running, Notification → permission,
 /// Stop → idle.
-fn claude_wanted() -> Vec<(&'static str, Value)> {
-    vec![
-        ("UserPromptSubmit", entry(event_command("running"))),
-        ("PreToolUse", entry(event_command("running"))),
-        ("Notification", entry(notify_command())),
-        ("Stop", entry(event_command("idle"))),
-    ]
+fn claude_wanted() -> Result<Vec<(&'static str, Value)>, String> {
+    Ok(vec![
+        ("UserPromptSubmit", entry(event_command("running")?)),
+        ("PreToolUse", entry(event_command("running")?)),
+        ("Notification", entry(notify_command()?)),
+        ("Stop", entry(event_command("idle")?)),
+    ])
 }
 
 fn codex_path() -> Option<PathBuf> {
@@ -236,12 +281,12 @@ fn codex_path() -> Option<PathBuf> {
 /// The event names and file layout are read off the shipped binary rather than
 /// public docs, so treat the schema as provisional: if a future codex renames
 /// these, the hooks simply never fire and the overlay degrades to scraping.
-fn codex_wanted() -> Vec<(&'static str, Value)> {
-    vec![
-        ("user_prompt_submit", entry(event_command("running"))),
-        ("pre_tool_use", entry(event_command("running"))),
-        ("permission_request", entry(event_command("permission"))),
-    ]
+fn codex_wanted() -> Result<Vec<(&'static str, Value)>, String> {
+    Ok(vec![
+        ("user_prompt_submit", entry(event_command("running")?)),
+        ("pre_tool_use", entry(event_command("running")?)),
+        ("permission_request", entry(event_command("permission")?)),
+    ])
 }
 
 fn opencode_path() -> Option<PathBuf> {
@@ -334,20 +379,28 @@ pub fn status() -> Vec<CliHooks> {
     {
         let path = claude_path();
         let wanted = claude_wanted();
+        let note = match &wanted {
+            Ok(_) => "approvals only fire when permission mode isn't auto-accept".to_string(),
+            Err(e) => e.clone(),
+        };
+        // On a refusal there is nothing we could have installed — and an empty
+        // `wanted` would make hooks_current vacuously true.
+        let refused = wanted.is_err();
+        let wanted = wanted.unwrap_or_default();
         let doc = path
             .as_deref()
             .and_then(|p| read_json_object(p).ok())
             .unwrap_or_default();
-        let installed = hooks_current(&doc, &wanted);
+        let installed = !refused && hooks_current(&doc, &wanted);
         out.push(CliHooks {
             id: "claude",
             name: "Claude Code",
             present: cli_present(path.clone().map(|p| p.with_file_name("")), "claude"),
             installed,
-            outdated: !installed && hooks_present(&doc, &wanted),
+            outdated: !refused && !installed && hooks_present(&doc, &wanted),
             path: path.map(|p| p.display().to_string()).unwrap_or_default(),
             exact_approval: true,
-            note: "approvals only fire when permission mode isn't auto-accept".into(),
+            note,
         });
     }
 
@@ -355,20 +408,28 @@ pub fn status() -> Vec<CliHooks> {
     {
         let path = codex_path();
         let wanted = codex_wanted();
+        let note = match &wanted {
+            Ok(_) => "no turn-end event: idle falls back to scraping".to_string(),
+            Err(e) => e.clone(),
+        };
+        // On a refusal there is nothing we could have installed — and an empty
+        // `wanted` would make hooks_current vacuously true.
+        let refused = wanted.is_err();
+        let wanted = wanted.unwrap_or_default();
         let doc = path
             .as_deref()
             .and_then(|p| read_json_object(p).ok())
             .unwrap_or_default();
-        let installed = hooks_current(&doc, &wanted);
+        let installed = !refused && hooks_current(&doc, &wanted);
         out.push(CliHooks {
             id: "codex",
             name: "OpenAI Codex CLI",
             present: cli_present(home().map(|h| h.join(".codex")), "codex"),
             installed,
-            outdated: !installed && hooks_present(&doc, &wanted),
+            outdated: !refused && !installed && hooks_present(&doc, &wanted),
             path: path.map(|p| p.display().to_string()).unwrap_or_default(),
             exact_approval: true,
-            note: "no turn-end event: idle falls back to scraping".into(),
+            note,
         });
     }
 
@@ -427,11 +488,11 @@ pub fn install_all() -> Vec<InstallOutcome> {
         } else {
             match cli.id {
                 "claude" => match claude_path() {
-                    Some(p) => install_json(&p, &claude_wanted()),
+                    Some(p) => claude_wanted().and_then(|w| install_json(&p, &w)),
                     None => Err("no home directory".into()),
                 },
                 "codex" => match codex_path() {
-                    Some(p) => install_json(&p, &codex_wanted()),
+                    Some(p) => codex_wanted().and_then(|w| install_json(&p, &w)),
                     None => Err("no home directory".into()),
                 },
                 "opencode" => match opencode_path() {
@@ -509,7 +570,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "installed");
+        assert_eq!(install_json(&path, &claude_wanted().unwrap()).unwrap(), "installed");
 
         let doc = read_json_object(&path).unwrap();
         assert_eq!(doc["model"], json!("opus"));
@@ -529,11 +590,11 @@ mod tests {
     fn install_is_idempotent() {
         let dir = tmp("idempotent");
         let path = dir.join("settings.json");
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "installed");
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "unchanged");
+        assert_eq!(install_json(&path, &claude_wanted().unwrap()).unwrap(), "installed");
+        assert_eq!(install_json(&path, &claude_wanted().unwrap()).unwrap(), "unchanged");
         let doc = read_json_object(&path).unwrap();
         assert_eq!(doc["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
-        assert!(hooks_current(&doc, &claude_wanted()));
+        assert!(hooks_current(&doc, &claude_wanted().unwrap()));
     }
 
     /// An upgrade moves the exe; the stale entry must be replaced, not doubled.
@@ -549,14 +610,14 @@ mod tests {
         )
         .unwrap();
         let doc = read_json_object(&path).unwrap();
-        assert!(hooks_present(&doc, &claude_wanted()));
-        assert!(!hooks_current(&doc, &claude_wanted()));
+        assert!(hooks_present(&doc, &claude_wanted().unwrap()));
+        assert!(!hooks_current(&doc, &claude_wanted().unwrap()));
 
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "updated");
+        assert_eq!(install_json(&path, &claude_wanted().unwrap()).unwrap(), "updated");
         let doc = read_json_object(&path).unwrap();
         let arr = doc["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 1, "stale entry replaced");
-        assert!(hooks_current(&doc, &claude_wanted()));
+        assert!(hooks_current(&doc, &claude_wanted().unwrap()));
     }
 
     /// The hand-merged curl payload from the README is ours to retire — it is
@@ -572,7 +633,7 @@ mod tests {
             format!(r#"{{"hooks":{{"Stop":[{{"hooks":[{{"type":"command","command":"{curl}"}}]}}]}}}}"#),
         )
         .unwrap();
-        assert_eq!(install_json(&path, &claude_wanted()).unwrap(), "updated");
+        assert_eq!(install_json(&path, &claude_wanted().unwrap()).unwrap(), "updated");
         let doc = read_json_object(&path).unwrap();
         assert_eq!(doc["hooks"]["Stop"].as_array().unwrap().len(), 1);
     }
@@ -583,7 +644,7 @@ mod tests {
         let dir = tmp("garbage");
         let path = dir.join("settings.json");
         std::fs::write(&path, "{not json").unwrap();
-        assert!(install_json(&path, &claude_wanted()).is_err());
+        assert!(install_json(&path, &claude_wanted().unwrap()).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
     }
 
@@ -592,13 +653,13 @@ mod tests {
         let dir = tmp("backup");
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
-        install_json(&path, &claude_wanted()).unwrap();
+        install_json(&path, &claude_wanted().unwrap()).unwrap();
         let bak = path.with_extension("json.agent-overlay.bak");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), r#"{"model":"opus"}"#);
 
         // A later install must not overwrite the pristine backup.
         std::fs::write(&path, r#"{"model":"changed"}"#).unwrap();
-        install_json(&path, &claude_wanted()).unwrap();
+        install_json(&path, &claude_wanted().unwrap()).unwrap();
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), r#"{"model":"opus"}"#);
     }
 
@@ -620,10 +681,56 @@ mod tests {
     /// Quoting is the whole reason command hooks broke on Windows.
     #[test]
     fn event_command_quotes_the_exe_path() {
-        let cmd = event_command("permission");
-        assert!(cmd.starts_with('"'), "exe path must be quoted: {cmd}");
+        let cmd = event_command("permission").unwrap();
+        let quote = if cfg!(windows) { '"' } else { '\'' };
+        assert!(cmd.starts_with(quote), "exe path must be quoted: {cmd}");
         assert!(cmd.ends_with("--hook-event permission"));
         assert!(is_ours(&cmd));
+    }
+
+    /// The Windows refusal can only be exercised on Windows, but the decision
+    /// behind it is plain string logic and worth pinning anywhere. `%` is legal
+    /// in a filename, and cmd.exe substitutes before it parses quotes, so a
+    /// variable whose *value* holds a quote escapes the command entirely.
+    #[test]
+    fn a_percent_in_the_path_is_refused_on_windows() {
+        assert!(cmd_would_expand(r"C:\Users\x\%FOO%\agent-overlay.exe"));
+        assert!(cmd_would_expand("C:/100%/agent-overlay.exe"));
+        assert!(!cmd_would_expand(
+            r"C:\Program Files\agent-overlay\agent-overlay.exe"
+        ));
+        assert!(!cmd_would_expand(
+            r"C:\Users\Ann O'Hara\AppData\Local\agent-overlay.exe"
+        ));
+    }
+
+    /// The quoting has to hold against a real shell, not just look right:
+    /// these hook commands are run by `sh -c` and persisted into the user's
+    /// settings.json, so a path that expands is a path that executes.
+    #[cfg(unix)]
+    #[test]
+    fn the_exe_path_reaches_sh_verbatim() {
+        for path in [
+            "/tmp/plain/agent-overlay",
+            "/tmp/with space/agent-overlay",
+            "/tmp/$(id -u)/agent-overlay",
+            "/tmp/`id -u`/agent-overlay",
+            "/tmp/$HOME/agent-overlay",
+            "/tmp/it's/agent-overlay",
+            r"/tmp/back\slash/agent-overlay",
+            "/tmp/semi;colon&amp/agent-overlay",
+        ] {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", quote_exe(path).unwrap()))
+                .output()
+                .expect("sh");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                path,
+                "sh mangled the path"
+            );
+        }
     }
 
     /// Every CLI must be reported, present or not, so the UI can list them.
