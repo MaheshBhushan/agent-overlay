@@ -15,6 +15,7 @@
 //! before.
 
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -145,7 +146,20 @@ fn is_permission_notification(payload: &str) -> bool {
     // Match on the message text rather than a fixed schema: the notification
     // wording ("Claude needs your permission to use Bash") is stabler across
     // versions than the envelope around it.
-    payload.to_ascii_lowercase().contains("permission")
+    //
+    // The message only, though — the envelope carries a cwd and a transcript
+    // path, and a session merely working in a directory called `permissions`
+    // must not read as one waiting for approval. Falling back to the whole
+    // payload when there's no message keeps an unrecognised schema working:
+    // missing a real approval is worse than an occasional false positive.
+    let message = serde_json::from_str::<Value>(payload)
+        .ok()
+        .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string));
+    message
+        .as_deref()
+        .unwrap_or(payload)
+        .to_ascii_lowercase()
+        .contains("permission")
 }
 
 /// Minimal HTTP request handling: enough for `curl -X POST -d '{...}'`.
@@ -330,6 +344,35 @@ mod tests {
             r#"{"message":"Claude is waiting for your input"}"#
         ));
         assert!(!is_permission_notification(""));
+    }
+
+    /// The envelope carries paths we don't control — a cwd or transcript path
+    /// under a directory called `permissions` would otherwise pin the session
+    /// in Needs Approval for the full 30-minute sticky window.
+    #[test]
+    fn only_the_message_decides_not_the_envelope() {
+        assert!(!is_permission_notification(
+            r#"{"cwd":"/home/u/src/permissions","message":"Claude is waiting for your input"}"#
+        ));
+        assert!(!is_permission_notification(
+            r#"{"transcript_path":"/home/u/.claude/permission-notes.jsonl","message":"Claude is waiting for your input"}"#
+        ));
+        // The message still decides, whatever else the envelope holds.
+        assert!(is_permission_notification(
+            r#"{"cwd":"/home/u/proj","message":"Claude needs your permission to use Bash"}"#
+        ));
+    }
+
+    /// We don't own this schema. If the payload isn't JSON, or carries no
+    /// message, fall back to the whole document rather than going silent —
+    /// missing an approval is worse than an occasional false positive.
+    #[test]
+    fn an_unrecognised_payload_still_falls_back() {
+        assert!(is_permission_notification("Claude needs your permission"));
+        assert!(is_permission_notification(
+            r#"{"detail":"permission required"}"#
+        ));
+        assert!(!is_permission_notification(r#"{"detail":"all done"}"#));
     }
 
     #[test]
