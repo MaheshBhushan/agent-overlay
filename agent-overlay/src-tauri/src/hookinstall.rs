@@ -201,11 +201,41 @@ fn write_json(path: &Path, doc: &Map<String, Value>) -> Result<(), String> {
     if path.exists() {
         let bak = path.with_extension("json.agent-overlay.bak");
         if !bak.exists() {
-            let _ = std::fs::copy(path, &bak);
+            std::fs::copy(path, &bak)
+                .map_err(|e| format!("cannot back up {}: {e}", path.display()))?;
         }
     }
     let body = serde_json::to_string_pretty(doc).map_err(|e| e.to_string())?;
-    std::fs::write(path, body + "\n").map_err(|e| format!("cannot write {}: {e}", path.display()))
+    // Write a sibling scratch file and rename it over the target. `fs::write`
+    // truncates first, so an interrupted write would leave the user's settings
+    // — everything in the file that isn't ours — truncated or half-written,
+    // and the one-time .bak above is no help on the second install. rename is
+    // atomic within a directory and replaces an existing target.
+    //
+    // Follow symlinks first: settings.json is often a link into a dotfiles
+    // repo, and renaming over the link would replace it with a regular file,
+    // leaving the repo copy stale. The pid keeps concurrent installs — first
+    // run racing the Windows installer's `--install-hooks` — off each other's
+    // scratch file.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let tmp = target.with_extension(format!("json.agent-overlay.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body + "\n").map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot write {}: {e}", tmp.display())
+    })?;
+    // rename takes the scratch file's permissions with it, so carry the
+    // original's across: a settings.json the user chmod 600'd holds `env` and
+    // `apiKeyHelper` and must not come back world-readable.
+    if let Ok(meta) = std::fs::metadata(&target) {
+        std::fs::set_permissions(&tmp, meta.permissions()).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("cannot set permissions on {}: {e}", tmp.display())
+        })?;
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot replace {}: {e}", target.display())
+    })
 }
 
 // ── per-CLI definitions ─────────────────────────────────────────────
@@ -600,6 +630,96 @@ mod tests {
         std::fs::write(&path, r#"{"model":"changed"}"#).unwrap();
         install_json(&path, &claude_wanted()).unwrap();
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), r#"{"model":"opus"}"#);
+    }
+
+    /// The backup is the whole reason we dare touch these files. If it can't be
+    /// made, the edit must not happen either.
+    ///
+    /// unix-only: a read-only directory is the portable-enough way to make
+    /// creating the `.bak` fail while leaving the existing file itself
+    /// readable and writable, which is what isolates the backup step.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_backup_stops_the_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp("bakfail");
+        let path = dir.join("settings.json");
+        let original = r#"{"model":"opus"}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let writable = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Mode 500 doesn't stop root, and CI often runs as root. Check the
+        // premise rather than reporting a failure the mode never caused.
+        if std::fs::File::create(dir.join("probe")).is_ok() {
+            std::fs::set_permissions(&dir, writable).unwrap();
+            return;
+        }
+        let result = install_json(&path, &claude_wanted());
+        let after = std::fs::read_to_string(&path).unwrap();
+        // Restore before asserting, so a failure doesn't leave an undeletable dir.
+        std::fs::set_permissions(&dir, writable).unwrap();
+
+        assert!(result.is_err(), "wrote without a backup: {result:?}");
+        assert_eq!(after, original);
+    }
+
+    /// The scratch file we rename through is an implementation detail and must
+    /// not be left lying next to the user's config.
+    #[test]
+    fn writing_leaves_no_scratch_file_behind() {
+        let dir = tmp("notemp");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
+        install_json(&path, &claude_wanted()).unwrap();
+
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left scratch files: {strays:?}");
+    }
+
+    /// A settings.json the user chmod 600'd holds `env` and `apiKeyHelper`.
+    /// Replacing it must not widen it to the default 644.
+    #[cfg(unix)]
+    #[test]
+    fn the_original_permissions_survive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp("perms");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"model":"opus"}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        install_json(&path, &claude_wanted()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "permissions widened to {mode:o}");
+    }
+
+    /// settings.json is commonly a symlink into a dotfiles repo. Writing must
+    /// go through the link, not replace it with a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_written_through() {
+        let dir = tmp("symlink");
+        let real = dir.join("dotfiles-settings.json");
+        let link = dir.join("settings.json");
+        std::fs::write(&real, r#"{"model":"opus"}"#).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        install_json(&link, &claude_wanted()).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the symlink was replaced by a regular file"
+        );
+        let doc = read_json_object(&real).unwrap();
+        assert_eq!(doc["model"], json!("opus"));
+        assert!(hooks_current(&doc, &claude_wanted()), "repo copy went stale");
     }
 
     #[test]
