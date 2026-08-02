@@ -183,7 +183,12 @@ fn handle(stream: TcpStream, on_show: &dyn Fn()) -> Option<()> {
         }
     }
     let mut body = vec![0u8; content_length.min(64 * 1024)];
-    reader.read_exact(&mut body).ok()?;
+    // A client that declares more than it sends must not cost us the response:
+    // treat a short read as an empty body and still answer below, rather than
+    // dropping the connection after having waited out the read timeout.
+    if reader.read_exact(&mut body).is_err() {
+        body.clear();
+    }
 
     let show = path == "/show" && method.eq_ignore_ascii_case("POST") && !from_browser;
     if path != "/show" {
@@ -462,6 +467,59 @@ mod tests {
         );
     }
 
+    /// A client that declares more body than it sends holds its connection for
+    /// the full 2s read timeout. The next hook event must not queue behind it,
+    /// and the stalled request must still be answered rather than dropped.
+    #[test]
+    fn a_stalled_client_does_not_block_the_next_event() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        serve(listener, || {});
+
+        // Declares 500 bytes, sends none, and keeps the socket open.
+        let mut stalled = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // Timeouts so a regression that leaves the connection open without
+        // answering fails the assertion instead of hanging the suite.
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stalled,
+            "POST /event HTTP/1.1\r\nHost: x\r\nContent-Length: 500\r\n\r\n"
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let body = r#"{"status":"running","pane":"%81","cwd":"/tmp/z"}"#;
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write!(
+            c,
+            "POST /event HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).unwrap();
+
+        assert!(resp.starts_with("HTTP/1.1 204"));
+        assert_eq!(override_for("%81", "/tmp/z").as_deref(), Some("running"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "queued behind the stalled client: {:?}",
+            started.elapsed()
+        );
+
+        // And the stalled one is still answered once its read times out.
+        let mut stalled_resp = String::new();
+        stalled.read_to_string(&mut stalled_resp).unwrap();
+        assert!(
+            stalled_resp.starts_with("HTTP/1.1 204"),
+            "stalled request got no response: {stalled_resp:?}"
+        );
+    }
+
     fn wait_until(cond: impl Fn() -> bool, msg: &str) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -476,10 +534,34 @@ mod tests {
 
 /// Start the listener thread on a port already claimed by [`claim`].
 /// `on_show` runs when a second launch hands its start-up over to us.
-pub fn serve(listener: TcpListener, on_show: impl Fn() + Send + 'static) {
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let _ = handle(stream, &on_show);
+pub fn serve(listener: TcpListener, on_show: impl Fn() + Send + Sync + 'static) {
+    let on_show = std::sync::Arc::new(on_show);
+    std::thread::spawn(move || loop {
+        match listener.accept() {
+            // One connection per thread: `handle` can sit on its 2s read
+            // timeout when a client declares more body than it sends, and a
+            // hook event arriving meanwhile must not wait behind it.
+            Ok((stream, _)) => {
+                let on_show = on_show.clone();
+                // Builder rather than thread::spawn: that one panics when the
+                // OS refuses a thread, which would unwind this loop and kill
+                // the listener for good — under exactly the exhaustion the arm
+                // below exists to ride out. On failure the closure drops with
+                // the connection: a dropped event is survivable (the scraper
+                // covers it), a dead listener is not.
+                if let Err(e) = std::thread::Builder::new().spawn(move || {
+                    let _ = handle(stream, on_show.as_ref());
+                }) {
+                    eprintln!("hook listener: cannot spawn handler: {e}");
+                }
+            }
+            // Never spin: a persistent failure here is fd exhaustion, which
+            // returns immediately and forever. Without the pause this thread
+            // burns a core with nothing logged and hooks silently dead.
+            Err(e) => {
+                eprintln!("hook listener: accept failed: {e}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     });
 }
