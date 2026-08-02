@@ -183,14 +183,38 @@ fn install_hooks_on_first_run(app: &tauri::AppHandle) {
     let Ok(dir) = app.path().app_config_dir() else {
         return;
     };
+    install_hooks_once(&dir, hookinstall::install_all);
+}
+
+/// Run `install` unless `dir` already records this `HOOKS_VERSION` as done,
+/// and record it only if nothing failed.
+///
+/// `install` is a parameter so this can be tested without writing hooks into
+/// the machine running the tests.
+fn install_hooks_once(
+    dir: &std::path::Path,
+    install: impl FnOnce() -> Vec<hookinstall::InstallOutcome>,
+) {
     let stamp = dir.join("hooks-installed");
     if std::fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == hookinstall::HOOKS_VERSION) {
         return;
     }
-    let outcomes = hookinstall::install_all();
+    // Before the install rather than after: the stamp can only land if the
+    // directory exists, and without a stamp the install runs again on every
+    // launch for the life of the install. Failing to make our own bookkeeping
+    // directory is no reason to skip hooks that would have installed fine —
+    // those live under $HOME/.claude and friends, a different tree.
+    let dir_ready = std::fs::create_dir_all(dir).is_ok();
+    let outcomes = install();
     hookinstall::report(&outcomes);
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(&stamp, hookinstall::HOOKS_VERSION);
+    // Stamping a failed install retires it permanently: nothing retries at the
+    // same HOOKS_VERSION, and `report` only reaches stderr, which a GUI launch
+    // throws away. Leave it unstamped so the next launch tries again — a repeat
+    // is cheap, since install_json/install_file return "unchanged" without
+    // touching the disk once a CLI is already set up.
+    if dir_ready && !outcomes.iter().any(|o| o.action == "failed") {
+        let _ = std::fs::write(&stamp, hookinstall::HOOKS_VERSION);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -320,4 +344,69 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hookinstall::InstallOutcome;
+
+    fn outcome(action: &str) -> InstallOutcome {
+        InstallOutcome {
+            id: "claude",
+            name: "Claude Code",
+            action: action.into(),
+            detail: String::new(),
+        }
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("agent-overlay-stamptest-{name}"));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    /// A stamped run is never retried at the same HOOKS_VERSION, so a failure
+    /// must not be recorded as done — the user would be left on scraping-only
+    /// status forever, with the reason only ever printed to a discarded stderr.
+    #[test]
+    fn a_failed_install_is_retried_next_launch() {
+        let dir = tmp("failed");
+        install_hooks_once(&dir, || vec![outcome("installed"), outcome("failed")]);
+        assert!(!dir.join("hooks-installed").exists(), "stamped a failure");
+
+        // So the next launch runs it again.
+        let mut ran = false;
+        install_hooks_once(&dir, || {
+            ran = true;
+            vec![outcome("installed")]
+        });
+        assert!(ran, "a failed install was not retried");
+        assert!(dir.join("hooks-installed").exists());
+    }
+
+    /// "skipped" is a CLI that isn't on this machine — nothing to retry. Once
+    /// stamped, a later launch must not run the install again.
+    #[test]
+    fn a_clean_install_is_stamped_and_not_repeated() {
+        let dir = tmp("clean");
+        install_hooks_once(&dir, || {
+            vec![
+                outcome("installed"),
+                outcome("unchanged"),
+                outcome("skipped"),
+            ]
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join("hooks-installed")).unwrap(),
+            hookinstall::HOOKS_VERSION
+        );
+
+        let mut ran = false;
+        install_hooks_once(&dir, || {
+            ran = true;
+            vec![]
+        });
+        assert!(!ran, "re-ran an install already stamped as done");
+    }
 }
