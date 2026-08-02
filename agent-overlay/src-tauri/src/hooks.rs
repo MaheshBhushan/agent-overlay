@@ -2,8 +2,8 @@
 //!
 //! A tiny HTTP listener on 127.0.0.1:8377 accepts POST /event with a JSON
 //! body like `{"status":"running","pane":"%3","cwd":"/home/me/proj"}`.
-//! Agent CLIs that support hooks (e.g. Claude Code's UserPromptSubmit /
-//! PreToolUse / Stop / Notification hooks) curl an event on each transition,
+//! Agent CLIs that support hooks (e.g. Claude Code's Notification hook, or
+//! opencode's tool/permission events) report an event on each transition,
 //! giving exact, instant status. Events are stored per pane (and per cwd as
 //! a fallback for non-tmux sessions) and override the scraped status while
 //! fresh; scraping remains the source of truth for agents without hooks.
