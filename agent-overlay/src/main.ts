@@ -52,6 +52,7 @@ const AGENT_BADGE: Record<string, string> = {
 };
 
 let sessions: AgentSession[] = [];
+let killingAll = false;
 
 const $ = <T extends HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
@@ -178,6 +179,7 @@ function render() {
   badge.classList.toggle("hidden", sessions.length === 0);
   badge.classList.toggle("all-idle",
     perms.length === 0 && running.length === 0 && idle.length > 0);
+  ($<HTMLButtonElement>("#btn-kill-all")).disabled = sessions.length === 0 || killingAll;
 
   // Collapsed-pill summary.
   $("#pill-running").textContent    = String(running.length);
@@ -443,6 +445,28 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   $("#btn-refresh").addEventListener("click", async () => {
     updateSessions(await invoke<AgentSession[]>("get_sessions"));
+  });
+
+  $("#btn-kill-all").addEventListener("click", async () => {
+    const ids = sessions.map((s) => s.session_id);
+    if (ids.length === 0 || !confirm(`Close all ${ids.length} agent sessions?`)) return;
+
+    killingAll = true;
+    document.body.classList.add("killing-all");
+    render();
+
+    const results = await Promise.allSettled(
+      ids.map((sessionId) => invoke<void>("kill_session", { sessionId })),
+    );
+    const closed = new Set(ids.filter((_, i) => results[i].status === "fulfilled"));
+    const failures = ids.flatMap((id, i) =>
+      results[i].status === "rejected" ? [`${id}: ${String(results[i].reason)}`] : [],
+    );
+    closed.forEach((id) => prevStatus.delete(id));
+    killingAll = false;
+    document.body.classList.remove("killing-all");
+    updateSessions(sessions.filter((s) => !closed.has(s.session_id)));
+    if (failures.length > 0) alert(`Could not close every session:\n${failures.join("\n")}`);
   });
 
   // Mute / unmute the completion + approval sounds.

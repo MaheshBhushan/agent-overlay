@@ -245,6 +245,21 @@ button:hover {
   background: rgba(120, 160, 255, 0.25);
 }
 
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+button.danger {
+  color: #ff9b9b;
+  border-color: rgba(255, 100, 100, 0.4);
+  background: rgba(255, 80, 80, 0.1);
+}
+
+button.danger:hover:not(:disabled) {
+  background: rgba(255, 80, 80, 0.25);
+}
+
 /* ── Kanban board ─────────────────────────────────────────── */
 
 #board {
@@ -332,7 +347,8 @@ button:hover {
   border-color: rgba(255, 255, 255, 0.15);
 }
 
-.card.exiting {
+.card.exiting,
+body.killing-all .card {
   opacity: 0.35;
   transform: scale(0.97);
   pointer-events: none;
