@@ -511,11 +511,9 @@ fn read_cpu_jiffies(pid: u32) -> Option<u64> {
 #[cfg(not(windows))]
 struct Stat {
     state: char,
-    pgrp: u32,
-    session: u32,
+    ppid: u32,
     tty_nr: i32,
     start_time: u64,
-    comm: String,
 }
 
 #[cfg(not(windows))]
@@ -529,41 +527,33 @@ fn parse_stat(s: &str) -> Option<Stat> {
     // comm sits in parens and may itself contain spaces/parens, so span from the
     // first '(' to the last ')'. Remaining fields are whitespace-separated:
     //   [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr ...
-    let open = s.find('(')?;
+    s.find('(')?;
     let close = s.rfind(')')?;
-    let comm = s.get(open + 1..close)?.to_string();
     let f: Vec<&str> = s.get(close + 2..)?.split_whitespace().collect();
     Some(Stat {
         state: f.first()?.chars().next()?,
-        pgrp: f.get(2)?.parse().ok()?,
-        session: f.get(3)?.parse().ok()?,
+        ppid: f.get(1)?.parse().ok()?,
         tty_nr: f.get(4)?.parse().ok()?,
         // /proc stat field 22; `f` begins at field 3 (state).
         start_time: f.get(19)?.parse().ok()?,
-        comm,
     })
 }
 
-/// The controlling terminal's Unix session is the tab boundary. It contains
-/// the shell, agent and tool children, but not the terminal-emulator process or
-/// sibling tabs. Never climb to the emulator: one emulator commonly owns every
-/// tab in its window.
+/// The controlling PTY is the terminal-tab boundary. Sibling tabs may share a
+/// terminal emulator and even a Unix session, but each interactive tab has its
+/// own PTY. Never broaden this to the session or emulator.
 #[cfg(not(windows))]
-fn terminal_session(agent: u32) -> Option<u32> {
+fn terminal_tty(agent: u32) -> Option<i32> {
     let a = read_stat(agent)?;
-    if a.tty_nr == 0 || a.session <= 1 {
+    if a.tty_nr <= 0 {
         return None;
     }
-    let leader = read_stat(a.session)?;
-    if leader.session != a.session
-        || leader.tty_nr != a.tty_nr
-        || a.session == std::process::id()
-        || leader.comm.starts_with("systemd")
-        || matches!(leader.comm.as_str(), "init" | "login")
-    {
+
+    // A development build launched inside the same tab must never kill itself.
+    if read_stat(std::process::id()).is_some_and(|overlay| overlay.tty_nr == a.tty_nr) {
         return None;
     }
-    Some(a.session)
+    Some(a.tty_nr)
 }
 
 pub fn kill(pid: u32, start_time: u64) -> Result<(), String> {
@@ -573,17 +563,17 @@ pub fn kill(pid: u32, start_time: u64) -> Result<(), String> {
 
     #[cfg(not(windows))]
     {
-        let session = terminal_session(pid);
-        match session {
-            Some(sid) => signal_session(sid, libc::SIGTERM),
+        let tty = terminal_tty(pid);
+        match tty {
+            Some(tty_nr) => signal_terminal(tty_nr, libc::SIGTERM),
             None => {
-                signal_group_and_pid(pid, start_time, libc::SIGTERM);
+                signal_process_tree(pid, libc::SIGTERM);
             }
         }
 
         for _ in 0..20 {
-            let ended = match session {
-                Some(sid) => session_members(sid).is_empty(),
+            let ended = match tty {
+                Some(tty_nr) => terminal_members(tty_nr).is_empty(),
                 None => !identity_matches(pid, start_time),
             };
             if ended {
@@ -592,9 +582,9 @@ pub fn kill(pid: u32, start_time: u64) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
 
-        match session {
-            Some(sid) => signal_session(sid, libc::SIGKILL),
-            None => signal_group_and_pid(pid, start_time, libc::SIGKILL),
+        match tty {
+            Some(tty_nr) => signal_terminal(tty_nr, libc::SIGKILL),
+            None => signal_process_tree(pid, libc::SIGKILL),
         }
         for _ in 0..20 {
             if !identity_matches(pid, start_time) {
@@ -636,10 +626,10 @@ pub fn kill(pid: u32, start_time: u64) -> Result<(), String> {
     }
 }
 
-/// All live processes in one Unix login/pty session. Rescanned for escalation
-/// so children created after SIGTERM are still contained.
+/// All live processes attached to one controlling PTY. Rescanned for
+/// escalation so children created after SIGTERM are still contained.
 #[cfg(not(windows))]
-fn session_members(sid: u32) -> Vec<(u32, u64)> {
+fn terminal_members(tty_nr: i32) -> Vec<(u32, u64)> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -647,19 +637,19 @@ fn session_members(sid: u32) -> Vec<(u32, u64)> {
         .flatten()
         .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
         .filter_map(|pid| read_stat(pid).map(|stat| (pid, stat)))
-        .filter(|(pid, stat)| {
-            stat.session == sid
-                && stat.state != 'Z'
-                && *pid > 1
-                && *pid != std::process::id()
-        })
+        .filter(|(pid, stat)| is_terminal_member(*pid, stat, tty_nr))
         .map(|(pid, stat)| (pid, stat.start_time))
         .collect()
 }
 
 #[cfg(not(windows))]
-fn signal_session(sid: u32, signal: libc::c_int) {
-    for (pid, start_time) in session_members(sid) {
+fn is_terminal_member(pid: u32, stat: &Stat, tty_nr: i32) -> bool {
+    stat.tty_nr == tty_nr && stat.state != 'Z' && pid > 1 && pid != std::process::id()
+}
+
+#[cfg(not(windows))]
+fn signal_terminal(tty_nr: i32, signal: libc::c_int) {
+    for (pid, start_time) in terminal_members(tty_nr) {
         signal_pid(pid, start_time, signal);
     }
 }
@@ -674,17 +664,35 @@ fn signal_pid(pid: u32, start_time: u64, signal: libc::c_int) {
 }
 
 #[cfg(not(windows))]
-fn signal_group_and_pid(pid: u32, start_time: u64, signal: libc::c_int) {
-    let Some(stat) = read_stat(pid).filter(|stat| stat.start_time == start_time) else {
+fn signal_process_tree(root: u32, signal: libc::c_int) {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
         return;
     };
-    unsafe {
-        // Never signal the overlay's own group if a headless process happens to
-        // share it. The verified agent pid is still safe to signal directly.
-        if stat.pgrp > 1 && stat.pgrp != libc::getpgrp() as u32 {
-            libc::kill(-(stat.pgrp as libc::pid_t), signal);
+    let processes: Vec<(u32, Stat)> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(|pid| read_stat(pid).map(|stat| (pid, stat)))
+        .collect();
+    let mut members = HashSet::from([root]);
+    loop {
+        let before = members.len();
+        for (pid, stat) in &processes {
+            if members.contains(&stat.ppid) {
+                members.insert(*pid);
+            }
         }
-        libc::kill(pid as libc::pid_t, signal);
+        if members.len() == before {
+            break;
+        }
+    }
+    for (pid, stat) in processes {
+        if members.contains(&pid)
+            && stat.state != 'Z'
+            && pid > 1
+            && pid != std::process::id()
+        {
+            signal_pid(pid, stat.start_time, signal);
+        }
     }
 }
 
@@ -697,17 +705,16 @@ mod tests {
     fn proc_stat_start_time_survives_parentheses_in_process_name() {
         let mut fields = vec!["0"; 20];
         fields[0] = "S";
-        fields[2] = "4000";
-        fields[3] = "4000";
+        fields[1] = "4000";
         fields[4] = "34819";
         fields[19] = "987654";
         let stat = parse_stat(&format!("4100 (claude ) worker) {}", fields.join(" "))).unwrap();
 
-        assert_eq!(stat.comm, "claude ) worker");
-        assert_eq!(stat.pgrp, 4000);
-        assert_eq!(stat.session, 4000);
+        assert_eq!(stat.ppid, 4000);
         assert_eq!(stat.tty_nr, 34819);
         assert_eq!(stat.start_time, 987654);
+        assert!(is_terminal_member(4100, &stat, 34819));
+        assert!(!is_terminal_member(4100, &stat, 34820));
     }
 
     #[test]
