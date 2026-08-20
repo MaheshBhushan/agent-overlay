@@ -7,6 +7,80 @@ mod procscan;
 mod sound;
 mod tmux;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use tmux::SessionTarget;
+
+struct SessionRegistry {
+    next_id: u64,
+    ids: HashMap<SessionTarget, String>,
+    targets: HashMap<String, SessionTarget>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            ids: HashMap::new(),
+            targets: HashMap::new(),
+        }
+    }
+}
+
+impl SessionRegistry {
+    fn assign(&mut self, sessions: &mut [tmux::AgentSession]) {
+        for session in sessions {
+            let id = match self.ids.get(&session.target) {
+                Some(id) => id.clone(),
+                None => {
+                    let id = format!("AO-{:02}", self.next_id);
+                    self.next_id += 1;
+                    self.ids.insert(session.target.clone(), id.clone());
+                    id
+                }
+            };
+            self.targets.insert(id.clone(), session.target.clone());
+            session.session_id = id;
+        }
+    }
+
+    fn target(&self, id: &str) -> Option<SessionTarget> {
+        self.targets.get(id).cloned()
+    }
+
+    fn remove(&mut self, id: &str) {
+        if let Some(target) = self.targets.remove(id) {
+            self.ids.remove(&target);
+        }
+    }
+}
+
+static SESSION_REGISTRY: Mutex<Option<SessionRegistry>> = Mutex::new(None);
+
+fn assign_session_ids(sessions: &mut [tmux::AgentSession]) {
+    SESSION_REGISTRY
+        .lock()
+        .unwrap()
+        .get_or_insert_with(SessionRegistry::default)
+        .assign(sessions);
+}
+
+fn session_target(id: &str) -> Result<SessionTarget, String> {
+    SESSION_REGISTRY
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|registry| registry.target(id))
+        .ok_or_else(|| format!("unknown or ended session {id}"))
+}
+
+fn forget_session(id: &str) {
+    if let Some(registry) = SESSION_REGISTRY.lock().unwrap().as_mut() {
+        registry.remove(id);
+    }
+}
+
 /// Re-export for the `focus` example / CLI debugging.
 pub fn focus_handle(handle: &str) -> Result<(), String> {
     focus::focus(handle)
@@ -19,7 +93,7 @@ pub fn discover_sessions() -> Vec<tmux::AgentSession> {
     let (mut sessions, pane_pids) = tmux::discover_with_pane_pids();
     sessions.extend(procscan::discover(&pane_pids));
     for s in &mut sessions {
-        if let Some(status) = hooks::override_for(&s.pane_id, &s.cwd) {
+        if let Some(status) = hooks::override_for(&s.pane_id, &s.cwd, s.target.start_time()) {
             // Note this discards the *value* only. hooks::record has already
             // overwritten the map entry by the time we get here, which is what
             // ends a sticky approval — see hookinstall::claude_wanted. Skipping
@@ -44,6 +118,7 @@ pub fn discover_sessions() -> Vec<tmux::AgentSession> {
             s.status = status;
         }
     }
+    assign_session_ids(&mut sessions);
     sessions
 }
 
@@ -55,19 +130,32 @@ fn get_sessions() -> Vec<tmux::AgentSession> {
 }
 
 #[tauri::command]
-fn send_text(pane_id: String, text: String) -> Result<(), String> {
-    if pane_id.starts_with("pid:") {
-        return Err("session is not in tmux — type in its own terminal".into());
+fn send_text(session_id: String, text: String) -> Result<(), String> {
+    let target = session_target(&session_id)?;
+    if !target.identity_matches() {
+        return Err(format!("session {session_id} has ended"));
     }
-    tmux::send_keys(&pane_id, &text, true)
+    if let SessionTarget::Tmux { pane_id, .. } = target {
+        return tmux::send_keys(&pane_id, &text, true);
+    }
+    Err("session is not in tmux — type in its own terminal".into())
 }
 
 #[tauri::command]
-fn kill_session(pane_id: String) -> Result<(), String> {
-    if pane_id.starts_with("pid:") {
-        return procscan::kill(&pane_id);
+fn kill_session(session_id: String) -> Result<(), String> {
+    let target = session_target(&session_id)?;
+    if !target.identity_matches() {
+        forget_session(&session_id);
+        return Err(format!("session {session_id} has ended"));
     }
-    tmux::kill_pane(&pane_id)
+    let result = match target {
+        SessionTarget::Tmux { pane_id, .. } => tmux::kill_pane(&pane_id),
+        SessionTarget::Process { pid, start_time } => procscan::kill(pid, start_time),
+    };
+    if result.is_ok() {
+        forget_session(&session_id);
+    }
+    result
 }
 
 #[tauri::command]
@@ -77,13 +165,25 @@ fn launch_session(agent: String, cwd: String) -> Result<String, String> {
 
 /// Bring the terminal hosting this session to the foreground.
 #[tauri::command]
-fn focus_session(pane_id: String) -> Result<(), String> {
-    focus::focus(&pane_id)
+fn focus_session(session_id: String) -> Result<(), String> {
+    let target = session_target(&session_id)?;
+    if !target.identity_matches() {
+        forget_session(&session_id);
+        return Err(format!("session {session_id} has ended"));
+    }
+    focus::focus(&target.handle())
 }
 
 #[tauri::command]
-fn capture_output(pane_id: String) -> String {
-    tmux::capture_pane(&pane_id, 200)
+fn capture_output(session_id: String) -> Result<String, String> {
+    let target = session_target(&session_id)?;
+    if !target.identity_matches() {
+        return Err(format!("session {session_id} has ended"));
+    }
+    match target {
+        SessionTarget::Tmux { pane_id, .. } => Ok(tmux::capture_pane(&pane_id, 200)),
+        SessionTarget::Process { .. } => Err("session is not in tmux".into()),
+    }
 }
 
 /// Unconditionally bring the overlay to the front. Used when a second launch
@@ -357,6 +457,70 @@ pub fn run() {
 mod tests {
     use super::*;
     use hookinstall::InstallOutcome;
+
+    fn session(target: SessionTarget) -> tmux::AgentSession {
+        tmux::AgentSession {
+            session_id: String::new(),
+            pane_id: target.handle(),
+            session_name: "terminal".into(),
+            window_index: "-".into(),
+            agent: "claude".into(),
+            cwd: "/project".into(),
+            status: "idle".into(),
+            idle_secs: Some(0),
+            tail: Vec::new(),
+            target,
+        }
+    }
+
+    #[test]
+    fn registry_keeps_an_id_for_one_process_lifetime() {
+        let target = SessionTarget::Process {
+            pid: 4100,
+            start_time: 123,
+        };
+        let mut registry = SessionRegistry::default();
+        let mut first = [session(target.clone())];
+        registry.assign(&mut first);
+        let mut rediscovered = [session(target)];
+        registry.assign(&mut rediscovered);
+
+        assert_eq!(first[0].session_id, "AO-01");
+        assert_eq!(rediscovered[0].session_id, "AO-01");
+    }
+
+    #[test]
+    fn reused_pid_gets_a_new_overlay_id() {
+        let mut registry = SessionRegistry::default();
+        let mut old = [session(SessionTarget::Process {
+            pid: 4100,
+            start_time: 123,
+        })];
+        registry.assign(&mut old);
+        let mut replacement = [session(SessionTarget::Process {
+            pid: 4100,
+            start_time: 456,
+        })];
+        registry.assign(&mut replacement);
+
+        assert_eq!(old[0].session_id, "AO-01");
+        assert_eq!(replacement[0].session_id, "AO-02");
+        assert_ne!(old[0].target, replacement[0].target);
+    }
+
+    #[test]
+    fn process_identity_is_not_exposed_to_the_webview() {
+        let mut value = session(SessionTarget::Process {
+            pid: 4100,
+            start_time: 123,
+        });
+        value.session_id = "AO-01".into();
+        let json = serde_json::to_value(value).unwrap();
+
+        assert_eq!(json["session_id"], "AO-01");
+        assert!(json.get("target").is_none());
+        assert!(json.get("start_time").is_none());
+    }
 
     fn outcome(action: &str) -> InstallOutcome {
         InstallOutcome {
