@@ -713,6 +713,18 @@ mod tests {
         assert_eq!(stat.ppid, 4000);
         assert_eq!(stat.tty_nr, 34819);
         assert_eq!(stat.start_time, 987654);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn sibling_tty_is_not_part_of_the_selected_tab() {
+        let stat = Stat {
+            state: 'S',
+            ppid: 4000,
+            tty_nr: 34819,
+            start_time: 987654,
+        };
+
         assert!(is_terminal_member(4100, &stat, 34819));
         assert!(!is_terminal_member(4100, &stat, 34820));
     }
