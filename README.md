@@ -28,7 +28,7 @@
 
 Run more than two or three coding agents at once and the bottleneck stops being the agents — it becomes finding the one that stopped. You end up cycling through tmux panes and terminal windows asking each one whether it is still working.
 
-Agent Overlay watches them all from outside. It finds agent CLIs in tmux panes *and* in plain terminal windows, sorts them into **running**, **idle** (with duration), and **needs approval**, and floats the result above whatever you are doing. Where an agent's CLI supports lifecycle hooks it reports transitions directly, so status is exact rather than inferred.
+Agent Overlay watches them all from outside. It finds agent CLIs in tmux panes *and* in plain terminal windows, gives each detected session a short overlay ID (`AO-01`, `AO-02`, …), sorts them into **running**, **idle** (with duration), and **needs approval**, and floats the result above whatever you are doing. Where an agent's CLI supports lifecycle hooks it reports transitions directly, so status is exact rather than inferred.
 
 Tauri v2 — Rust backend, vanilla-TypeScript frontend. Linux and Windows.
 

@@ -52,6 +52,21 @@ const AGENT_BADGE: Record<string, string> = {
 
 let sessions: AgentSession[] = [];
 
+// Human-facing identities for this overlay run. pane_id remains the backend
+// handle used to focus/close a session; this short label is only there so two
+// otherwise-identical agent tabs can be discussed and tracked unambiguously.
+const sessionIds = new Map<string, string>();
+let nextSessionId = 1;
+
+function sessionId(paneId: string): string {
+  let id = sessionIds.get(paneId);
+  if (!id) {
+    id = `AO-${String(nextSessionId++).padStart(2, "0")}`;
+    sessionIds.set(paneId, id);
+  }
+  return id;
+}
+
 const $ = <T extends HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
 
@@ -74,6 +89,9 @@ let prevStatus = new Map<string, string>();
 let primed = false; // skip sounds on the very first snapshot
 
 function updateSessions(next: AgentSession[]) {
+  // Allocate before rendering so a session keeps the same ID while moving
+  // between status columns on this or any later update.
+  for (const s of next) sessionId(s.pane_id);
   if (primed) {
     for (const s of next) {
       const before = prevStatus.get(s.pane_id);
@@ -138,6 +156,7 @@ function cardHtml(s: AgentSession): string {
   return `<div class="card" data-pane="${esc(s.pane_id)}" title="Double-click to open terminal">
     <div class="card-head">
       <span class="agent-badge">${esc(badge)}</span>
+      <span class="session-id" title="Overlay session ID · ${esc(s.pane_id)}">${sessionId(s.pane_id)}</span>
       <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
       ${srcTag}
       <button class="kill" data-pane="${esc(s.pane_id)}" title="Kill session">✕</button>
@@ -407,7 +426,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     const el = e.target as HTMLElement;
     if (el.classList.contains("kill")) {
       const pane = el.dataset.pane;
-      if (pane && confirm("Close the whole terminal for this session?")) {
+      const label = pane ? sessionId(pane) : "this session";
+      if (pane && confirm(`Close the whole terminal for ${label}?`)) {
         // Tear down the backend FIRST (kill the process group), then unmount the
         // card. Removing it from state before a successful kill would orphan a
         // live session with no card. The `.exiting` class is a transient exit

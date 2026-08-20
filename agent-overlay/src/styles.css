@@ -360,6 +360,14 @@ button:hover {
   flex-shrink: 0;
 }
 
+.session-id {
+  color: #b8c8ee;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  flex-shrink: 0;
+}
+
 .term-tag {
   background: #271e40;
   color: #c7a8ff;
