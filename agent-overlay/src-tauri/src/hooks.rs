@@ -52,6 +52,9 @@ struct HookEvent {
 struct Entry {
     status: String,
     at: Instant,
+    /// Process creation value for pid-keyed events; prevents a stale hook from
+    /// attaching to a replacement process that reused the same pid.
+    start_time: Option<u64>,
 }
 
 static STATE: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
@@ -61,40 +64,50 @@ fn record(status: &str, pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) {
         return;
     }
     let pane = pane.filter(|p| !p.is_empty()).map(str::to_string);
+    let live_pids: Vec<(u32, u64)> = pids
+        .iter()
+        .filter_map(|pid| crate::procscan::process_start_time(*pid).map(|start| (*pid, start)))
+        .collect();
     // A pane id or a pid names one session. `cwd` names a folder, and two
     // agents working in one folder are a normal thing to do — so it is the
     // last resort, used only when nothing precise is available. Writing it
     // alongside a precise key is what used to put an idle sibling in the
     // Needs Approval column next to the session actually waiting.
-    let precise = pane.is_some() || !pids.is_empty();
+    let precise = pane.is_some() || !live_pids.is_empty();
     let mut guard = STATE.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
     let now = Instant::now();
-    for key in pane
-        .into_iter()
-        .chain(pids.iter().map(|p| format!("pid:{p}")))
-        .chain(
-            cwd.filter(|c| !c.is_empty() && !precise)
-                .map(|c| format!("cwd:{c}")),
-        )
-    {
+    let mut keys: Vec<(String, Option<u64>)> = pane.into_iter().map(|key| (key, None)).collect();
+    keys.extend(
+        live_pids
+            .into_iter()
+            .map(|(pid, start)| (format!("pid:{pid}"), Some(start))),
+    );
+    if let Some(cwd) = cwd.filter(|c| !c.is_empty() && !precise) {
+        keys.push((format!("cwd:{cwd}"), None));
+    }
+    for (key, start_time) in keys {
         map.insert(
             key,
             Entry {
                 status: status.to_string(),
                 at: now,
+                start_time,
             },
         );
     }
 }
 
 /// Fresh hook-reported status for a session, if any. Pane id wins over cwd.
-pub fn override_for(pane_id: &str, cwd: &str) -> Option<String> {
+pub fn override_for(pane_id: &str, cwd: &str, start_time: u64) -> Option<String> {
     let guard = STATE.lock().unwrap();
     let map = guard.as_ref()?;
     let now = Instant::now();
     for key in [pane_id.to_string(), format!("cwd:{cwd}")] {
         if let Some(e) = map.get(&key) {
+            if e.start_time.is_some_and(|recorded| recorded != start_time) {
+                continue;
+            }
             let ttl = if e.status == "permission" {
                 PERMISSION_TTL_SECS
             } else {
@@ -355,6 +368,15 @@ fn request_show(port: u16) -> bool {
 mod tests {
     use super::*;
 
+    fn override_for(handle: &str, cwd: &str) -> Option<String> {
+        let start_time = handle
+            .strip_prefix("pid:")
+            .and_then(|pid| pid.parse().ok())
+            .and_then(crate::procscan::process_start_time)
+            .unwrap_or(0);
+        super::override_for(handle, cwd, start_time)
+    }
+
     #[test]
     fn record_and_override_by_pane_and_cwd() {
         // No pane and no pids: cwd is all we have, so it is used.
@@ -391,12 +413,33 @@ mod tests {
 
         // And the same for a session outside tmux, named by pid.
         let cwd2 = "/tmp/shared-two";
-        record("permission", None, Some(cwd2), &[4242]);
+        let pid = std::process::id();
+        record("permission", None, Some(cwd2), &[pid]);
         assert_eq!(
-            override_for("pid:4242", cwd2).as_deref(),
+            override_for(&format!("pid:{pid}"), cwd2).as_deref(),
             Some("permission")
         );
-        assert_eq!(override_for("pid:4243", cwd2), None, "sibling pid flagged");
+        assert_eq!(
+            override_for(&format!("pid:{}", pid + 1), cwd2),
+            None,
+            "sibling pid flagged"
+        );
+    }
+
+    #[test]
+    fn pid_reuse_does_not_inherit_a_hook_status() {
+        let pid = std::process::id();
+        let start = crate::procscan::process_start_time(pid).unwrap();
+        record("permission", None, None, &[pid]);
+
+        assert_eq!(
+            super::override_for(&format!("pid:{pid}"), "", start).as_deref(),
+            Some("permission")
+        );
+        assert_eq!(
+            super::override_for(&format!("pid:{pid}"), "", start + 1),
+            None
+        );
     }
 
     /// Approving is not itself an event, so the next thing the session does is
