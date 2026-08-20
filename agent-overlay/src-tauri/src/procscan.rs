@@ -248,10 +248,10 @@ mod win {
     /// Is the process still present? Called immediately after a kill to decide
     /// whether it worked, so it must not answer from a snapshot taken before
     /// the kill — that would report a false failure for a successful kill.
-    pub fn alive(pid: u32) -> bool {
+    pub fn identity_alive(pid: u32, start_time: u64) -> bool {
         kill_path_system()
             .process(sysinfo::Pid::from_u32(pid))
-            .is_some()
+            .is_some_and(|process| process.start_time() == start_time)
     }
 
     /// Close the terminal *tab* hosting an agent, the way `exit` would: walk UP
@@ -264,9 +264,15 @@ mod win {
     /// an open-ended list of terminals like the Linux side avoids); we stop the
     /// upward walk when the parent is one of them, so the shell is the last node
     /// before the host.
-    pub fn close_agent(agent: u32) {
+    pub fn close_agent(agent: u32, start_time: u64) -> bool {
         use std::collections::HashMap;
         let sys = kill_path_system();
+        if !sys
+            .process(sysinfo::Pid::from_u32(agent))
+            .is_some_and(|process| process.start_time() == start_time)
+        {
+            return false;
+        }
         let mut parent: HashMap<u32, u32> = HashMap::new();
         let mut name: HashMap<u32, String> = HashMap::new();
         for (pid, proc_) in sys.processes() {
@@ -316,6 +322,7 @@ mod win {
                 p.kill();
             }
         }
+        true
     }
 }
 
@@ -491,12 +498,13 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     win::start_time(pid)
 }
 
-/// Terminate a non-tmux agent session by pid.
-#[cfg(not(windows))]
-fn proc_comm(pid: u32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "?".into())
+pub fn identity_matches(pid: u32, start_time: u64) -> bool {
+    process_start_time(pid) == Some(start_time)
+}
+
+#[cfg(windows)]
+fn read_cpu_jiffies(pid: u32) -> Option<u64> {
+    win::cpu_jiffies(pid)
 }
 
 /// Fields we care about from /proc/<pid>/stat.
