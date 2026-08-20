@@ -718,7 +718,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn sibling_tty_is_not_part_of_the_selected_tab() {
-        let stat = Stat {
+        let mut stat = Stat {
             state: 'S',
             ppid: 4000,
             tty_nr: 34819,
@@ -727,6 +727,11 @@ mod tests {
 
         assert!(is_terminal_member(4100, &stat, 34819));
         assert!(!is_terminal_member(4100, &stat, 34820));
+        assert!(!is_terminal_member(1, &stat, 34819));
+        assert!(!is_terminal_member(std::process::id(), &stat, 34819));
+
+        stat.state = 'Z';
+        assert!(!is_terminal_member(4100, &stat, 34819));
     }
 
     #[test]
