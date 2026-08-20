@@ -409,7 +409,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     const el = e.target as HTMLElement;
     if (el.classList.contains("kill")) {
       const sessionId = el.dataset.session;
-      if (sessionId && confirm(`Close the whole terminal for ${sessionId}?`)) {
+      if (sessionId && confirm(`Close the terminal tab for ${sessionId}?`)) {
         // Tear down the verified backend target FIRST, then unmount the card.
         // Removing it from state before a successful close would orphan a
         // live session with no card. The `.exiting` class is a transient exit
