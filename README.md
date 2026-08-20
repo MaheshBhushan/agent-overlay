@@ -93,6 +93,10 @@ Every second, the overlay:
 - queries `tmux list-panes -a` and walks each pane's process tree, which catches agents running as child `node` processes;
 - scans the system process table for agent CLIs outside tmux — IDE terminals, standalone windows — keeping only the top-most match per session.
 
+Each card's `AO-*` label is assigned by the Rust backend, not the webview. Native sessions are keyed by **PID plus process creation time**, so a PID reused by the OS becomes a new overlay session instead of inheriting a stale card or action target. Focus and close commands carry only the opaque `AO-*` ID; the backend resolves it and rechecks the creation time immediately before acting. Tmux sessions remain keyed to their pane plus the agent process identity and close through `tmux kill-pane`.
+
+For plain Linux terminals, closing targets only the selected controlling-terminal session (shell, agent and its tools), first with `SIGTERM` and then `SIGKILL` if necessary. It never signals the terminal-emulator process that may own sibling tabs. On Windows, discovered sessions are creation-time verified before the existing shell-subtree close path runs.
+
 Status comes from three sources, most trusted first:
 
 | Status | How it is decided |
