@@ -156,6 +156,7 @@ function cardHtml(s: AgentSession): string {
   return `<div class="card" data-pane="${esc(s.pane_id)}" title="Double-click to open terminal">
     <div class="card-head">
       <span class="agent-badge">${esc(badge)}</span>
+      <span class="session-id" title="Overlay session ID · ${esc(s.pane_id)}">${sessionId(s.pane_id)}</span>
       <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
       ${srcTag}
       <button class="kill" data-pane="${esc(s.pane_id)}" title="Kill session">✕</button>
