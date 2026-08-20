@@ -10,6 +10,7 @@ import {
 } from "@tauri-apps/api/window";
 
 interface AgentSession {
+  session_id: string;
   pane_id: string;
   session_name: string;
   window_index: string;
@@ -52,21 +53,6 @@ const AGENT_BADGE: Record<string, string> = {
 
 let sessions: AgentSession[] = [];
 
-// Human-facing identities for this overlay run. pane_id remains the backend
-// handle used to focus/close a session; this short label is only there so two
-// otherwise-identical agent tabs can be discussed and tracked unambiguously.
-const sessionIds = new Map<string, string>();
-let nextSessionId = 1;
-
-function sessionId(paneId: string): string {
-  let id = sessionIds.get(paneId);
-  if (!id) {
-    id = `AO-${String(nextSessionId++).padStart(2, "0")}`;
-    sessionIds.set(paneId, id);
-  }
-  return id;
-}
-
 const $ = <T extends HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
 
@@ -84,24 +70,21 @@ function playSound(kind: "done" | "approval", force = false) {
   invoke("play_sound", { kind }).catch(() => { /* audio unavailable — ignore */ });
 }
 
-// Previous status per pane, to detect transitions between updates.
+// Previous status per verified backend session, to detect transitions.
 let prevStatus = new Map<string, string>();
 let primed = false; // skip sounds on the very first snapshot
 
 function updateSessions(next: AgentSession[]) {
-  // Allocate before rendering so a session keeps the same ID while moving
-  // between status columns on this or any later update.
-  for (const s of next) sessionId(s.pane_id);
   if (primed) {
     for (const s of next) {
-      const before = prevStatus.get(s.pane_id);
+      const before = prevStatus.get(s.session_id);
       if (before && before !== s.status) {
         if (s.status === "idle" && before === "running") playSound("done");
         else if (s.status === "permission") playSound("approval");
       }
     }
   }
-  prevStatus = new Map(next.map(s => [s.pane_id, s.status]));
+  prevStatus = new Map(next.map(s => [s.session_id, s.status]));
   primed = true;
   sessions = next;
   render();
@@ -116,7 +99,7 @@ const ESCAPES: Record<string, string> = {
 };
 
 /// Escape for both element and attribute context. The quotes matter: cardHtml
-/// interpolates into `title="…"` and `data-pane="…"`, and cwd/pane_id come
+/// interpolates into `title="…"` and `data-session="…"`, and cwd/pane_id come
 /// from scanned processes and tmux, so a directory named `x" onmouseover="…`
 /// would otherwise close the attribute and run in the webview.
 ///
@@ -153,13 +136,13 @@ function cardHtml(s: AgentSession): string {
     : "";
   const tailText = s.tail.slice(-2).join("\n").trim();
 
-  return `<div class="card" data-pane="${esc(s.pane_id)}" title="Double-click to open terminal">
+  return `<div class="card" data-session="${esc(s.session_id)}" title="Double-click to open terminal">
     <div class="card-head">
       <span class="agent-badge">${esc(badge)}</span>
-      <span class="session-id" title="Overlay session ID · ${esc(s.pane_id)}">${sessionId(s.pane_id)}</span>
+      <span class="session-id" title="Overlay session ID · ${esc(s.pane_id)}">${esc(s.session_id)}</span>
       <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
       ${srcTag}
-      <button class="kill" data-pane="${esc(s.pane_id)}" title="Kill session">✕</button>
+      <button class="kill" data-session="${esc(s.session_id)}" title="Kill session">✕</button>
     </div>
     <div class="card-meta">
       <span class="card-path" title="${esc(s.cwd)}">${esc(s.cwd)}</span>
@@ -425,20 +408,19 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.body.addEventListener("click", (e) => {
     const el = e.target as HTMLElement;
     if (el.classList.contains("kill")) {
-      const pane = el.dataset.pane;
-      const label = pane ? sessionId(pane) : "this session";
-      if (pane && confirm(`Close the whole terminal for ${label}?`)) {
-        // Tear down the backend FIRST (kill the process group), then unmount the
-        // card. Removing it from state before a successful kill would orphan a
+      const sessionId = el.dataset.session;
+      if (sessionId && confirm(`Close the whole terminal for ${sessionId}?`)) {
+        // Tear down the verified backend target FIRST, then unmount the card.
+        // Removing it from state before a successful close would orphan a
         // live session with no card. The `.exiting` class is a transient exit
         // animation that ends in a real unmount, never a resting width:0 state.
         const card = el.closest(".card") as HTMLElement | null;
         card?.classList.add("exiting");
-        invoke("kill_session", { paneId: pane })
+        invoke("kill_session", { sessionId })
           .then(() => {
             // Process is confirmed gone (backend waits for /proc to clear).
-            prevStatus.delete(pane);
-            updateSessions(sessions.filter((s) => s.pane_id !== pane));
+            prevStatus.delete(sessionId);
+            updateSessions(sessions.filter((s) => s.session_id !== sessionId));
           })
           .catch((err) => {
             card?.classList.remove("exiting");
@@ -450,8 +432,8 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   document.body.addEventListener("dblclick", (e) => {
     const card = (e.target as HTMLElement).closest(".card") as HTMLElement | null;
-    if (!card?.dataset.pane || (e.target as HTMLElement).classList.contains("kill")) return;
-    invoke("focus_session", { paneId: card.dataset.pane }).catch((err) =>
+    if (!card?.dataset.session || (e.target as HTMLElement).classList.contains("kill")) return;
+    invoke("focus_session", { sessionId: card.dataset.session }).catch((err) =>
       alert(`Could not open terminal: ${err}`)
     );
   });
