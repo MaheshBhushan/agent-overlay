@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::claude_status;
-use crate::tmux::{agent_from_args, process_table, AgentSession};
+use crate::tmux::{agent_from_args, process_table, AgentSession, SessionTarget};
 
 /// CPU jiffies per poll that count as an "active" sample. Measured: idle
 /// agent TUIs burn 0–1 jiffies/s (cursor blink), actively-executing claude
@@ -238,13 +238,20 @@ mod win {
         })
     }
 
+    pub fn start_time(pid: u32) -> Option<u64> {
+        with_system(|sys, _| {
+            sys.process(sysinfo::Pid::from_u32(pid))
+                .map(|p| p.start_time())
+        })
+    }
+
     /// Is the process still present? Called immediately after a kill to decide
     /// whether it worked, so it must not answer from a snapshot taken before
     /// the kill — that would report a false failure for a successful kill.
-    pub fn alive(pid: u32) -> bool {
+    pub fn identity_alive(pid: u32, start_time: u64) -> bool {
         kill_path_system()
             .process(sysinfo::Pid::from_u32(pid))
-            .is_some()
+            .is_some_and(|process| process.start_time() == start_time)
     }
 
     /// Close the terminal *tab* hosting an agent, the way `exit` would: walk UP
@@ -257,9 +264,15 @@ mod win {
     /// an open-ended list of terminals like the Linux side avoids); we stop the
     /// upward walk when the parent is one of them, so the shell is the last node
     /// before the host.
-    pub fn close_agent(agent: u32) {
+    pub fn close_agent(agent: u32, start_time: u64) -> bool {
         use std::collections::HashMap;
         let sys = kill_path_system();
+        if !sys
+            .process(sysinfo::Pid::from_u32(agent))
+            .is_some_and(|process| process.start_time() == start_time)
+        {
+            return false;
+        }
         let mut parent: HashMap<u32, u32> = HashMap::new();
         let mut name: HashMap<u32, String> = HashMap::new();
         for (pid, proc_) in sys.processes() {
@@ -309,6 +322,7 @@ mod win {
                 p.kill();
             }
         }
+        true
     }
 }
 
@@ -383,6 +397,9 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
     for pid in &tops {
         let agent = matched[pid].clone();
         let cwd = read_cwd(*pid);
+        let Some(start_time) = process_start_time(*pid) else {
+            continue;
+        };
 
         let cpu = read_cpu_jiffies(*pid).unwrap_or(0);
         let entry = activity.entry(*pid).or_insert(ProcActivity {
@@ -419,6 +436,7 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
         };
 
         sessions.push(AgentSession {
+            session_id: String::new(),
             pane_id: format!("pid:{pid}"),
             session_name: "terminal".to_string(),
             window_index: "-".to_string(),
@@ -427,6 +445,10 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
             status,
             idle_secs,
             tail: Vec::new(),
+            target: SessionTarget::Process {
+                pid: *pid,
+                start_time,
+            },
         });
     }
 
@@ -463,113 +485,114 @@ fn read_cpu_jiffies(pid: u32) -> Option<u64> {
     Some(utime + stime)
 }
 
+/// Kernel process creation value. Linux returns clock ticks since boot;
+/// Windows returns sysinfo's process start timestamp. It is only compared on
+/// the same machine/backend, so the units do not need normalization.
+#[cfg(not(windows))]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    read_stat(pid).map(|s| s.start_time)
+}
+
+#[cfg(windows)]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    win::start_time(pid)
+}
+
+pub fn identity_matches(pid: u32, start_time: u64) -> bool {
+    process_start_time(pid) == Some(start_time)
+}
+
 #[cfg(windows)]
 fn read_cpu_jiffies(pid: u32) -> Option<u64> {
     win::cpu_jiffies(pid)
 }
 
-/// Terminate a non-tmux agent session by pid.
-#[cfg(not(windows))]
-fn proc_comm(pid: u32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "?".into())
-}
-
 /// Fields we care about from /proc/<pid>/stat.
 #[cfg(not(windows))]
 struct Stat {
+    state: char,
     ppid: u32,
-    session: u32,
     tty_nr: i32,
-    comm: String,
+    start_time: u64,
 }
 
 #[cfg(not(windows))]
 fn read_stat(pid: u32) -> Option<Stat> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat(&s)
+}
+
+#[cfg(not(windows))]
+fn parse_stat(s: &str) -> Option<Stat> {
     // comm sits in parens and may itself contain spaces/parens, so span from the
     // first '(' to the last ')'. Remaining fields are whitespace-separated:
     //   [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr ...
-    let open = s.find('(')?;
+    s.find('(')?;
     let close = s.rfind(')')?;
-    let comm = s.get(open + 1..close)?.to_string();
     let f: Vec<&str> = s.get(close + 2..)?.split_whitespace().collect();
     Some(Stat {
+        state: f.first()?.chars().next()?,
         ppid: f.get(1)?.parse().ok()?,
-        session: f.get(3)?.parse().ok()?,
         tty_nr: f.get(4)?.parse().ok()?,
-        comm,
+        // /proc stat field 22; `f` begins at field 3 (state).
+        start_time: f.get(19)?.parse().ok()?,
     })
 }
 
-/// Find the terminal emulator hosting an agent — structurally, with no list of
-/// terminal names. A terminal opens a pty, then forks a child that calls
-/// setsid(): that child becomes the *session leader* and gains the pty as its
-/// controlling terminal, while the terminal emulator stays in its own, different
-/// session. So the emulator is precisely "the parent of the agent's session
-/// leader, living in a different session." This holds for konsole, alacritty,
-/// kitty, foot, xterm, gnome-terminal, sshd, … — anything that spawns a pty.
-///
-/// Returns None when there's no controlling terminal (headless / piped) or the
-/// candidate is a system process (pid 1, systemd, login), so we never nuke init.
+/// The controlling PTY is the terminal-tab boundary. Sibling tabs may share a
+/// terminal emulator and even a Unix session, but each interactive tab has its
+/// own PTY. Never broaden this to the session or emulator.
 #[cfg(not(windows))]
-fn hosting_terminal(agent: u32) -> Option<u32> {
+fn terminal_tty(agent: u32) -> Option<i32> {
     let a = read_stat(agent)?;
-    if a.tty_nr == 0 {
-        return None; // no controlling terminal to speak of
-    }
-    let leader = read_stat(a.session)?; // the session leader (usually the shell)
-    let cand = leader.ppid; // its parent = the pty master side = the emulator
-    if cand <= 1 {
+    if a.tty_nr <= 0 {
         return None;
     }
-    let c = read_stat(cand)?;
-    // The real emulator is in a *different* session than the agent, and isn't a
-    // core system process.
-    if c.session == a.session {
+
+    // A development build launched inside the same tab must never kill itself.
+    if read_stat(std::process::id()).is_some_and(|overlay| overlay.tty_nr == a.tty_nr) {
         return None;
     }
-    if cand == std::process::id() || c.comm.starts_with("systemd") || c.comm == "init"
-        || c.comm == "login"
-    {
-        return None;
-    }
-    Some(cand)
+    Some(a.tty_nr)
 }
 
-pub fn kill(pid_handle: &str) -> Result<(), String> {
-    let pid: u32 = pid_handle
-        .strip_prefix("pid:")
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| format!("bad pid handle {pid_handle}"))?;
+pub fn kill(pid: u32, start_time: u64) -> Result<(), String> {
+    if !identity_matches(pid, start_time) {
+        return Err(format!("process identity for pid {pid} no longer matches"));
+    }
 
     #[cfg(not(windows))]
     {
-        let alive = |p: u32| std::path::Path::new(&format!("/proc/{p}")).exists();
-        match hosting_terminal(pid) {
-            Some(term) => {
-                eprintln!(
-                    "[kill] agent pid={pid} -> closing hosting terminal pid={term} comm={}",
-                    proc_comm(term)
-                );
-                kill_group_and_pid(term);
-            }
+        let tty = terminal_tty(pid);
+        match tty {
+            Some(tty_nr) => signal_terminal(tty_nr, libc::SIGTERM),
             None => {
-                eprintln!("[kill] agent pid={pid}: no distinct terminal, killing agent group only");
+                signal_process_tree(pid, libc::SIGTERM);
             }
         }
-        // Always also take down the agent's own group, in case it ignores the
-        // pty hangup or was launched without a terminal.
-        kill_group_and_pid(pid);
 
         for _ in 0..20 {
-            if !alive(pid) {
+            let ended = match tty {
+                Some(tty_nr) => terminal_members(tty_nr).is_empty(),
+                None => !identity_matches(pid, start_time),
+            };
+            if ended {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        return if alive(pid) {
+
+        match tty {
+            Some(tty_nr) => signal_terminal(tty_nr, libc::SIGKILL),
+            None => signal_process_tree(pid, libc::SIGKILL),
+        }
+        for _ in 0..20 {
+            if !identity_matches(pid, start_time) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        return if identity_matches(pid, start_time) {
             Err(format!("failed to kill pid {pid}"))
         } else {
             Ok(())
@@ -582,18 +605,20 @@ pub fn kill(pid_handle: &str) -> Result<(), String> {
         // and kill its subtree — that's what makes the terminal close the tab,
         // exactly like typing `exit` (killing only the agent leaves the shell
         // alive and the window open).
-        win::close_agent(pid);
+        if !win::close_agent(pid, start_time) {
+            return Err(format!("process identity for pid {pid} no longer matches"));
+        }
         // TerminateProcess is asynchronous: the process stays in the table
         // until its threads reap, so a single immediate check reports a false
         // failure for a kill that did work. Same settle loop as the Linux
         // branch above.
         for _ in 0..20 {
-            if !win::alive(pid) {
+            if !win::identity_alive(pid, start_time) {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
-        if win::alive(pid) {
+        if win::identity_alive(pid, start_time) {
             Err(format!("failed to kill pid {pid}"))
         } else {
             Ok(())
@@ -601,23 +626,113 @@ pub fn kill(pid_handle: &str) -> Result<(), String> {
     }
 }
 
-/// SIGKILL a process group and the pid itself, via the raw syscall (no PATH
-/// dependency). Safe: kill/getpgid with a pid + signal have no memory effects.
+/// All live processes attached to one controlling PTY. Rescanned for
+/// escalation so children created after SIGTERM are still contained.
 #[cfg(not(windows))]
-fn kill_group_and_pid(pid: u32) {
-    let p = pid as libc::pid_t;
-    unsafe {
-        let pgid = libc::getpgid(p);
-        if pgid > 0 {
-            libc::kill(-pgid, libc::SIGKILL);
+fn terminal_members(tty_nr: i32) -> Vec<(u32, u64)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(|pid| read_stat(pid).map(|stat| (pid, stat)))
+        .filter(|(pid, stat)| is_terminal_member(*pid, stat, tty_nr))
+        .map(|(pid, stat)| (pid, stat.start_time))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn is_terminal_member(pid: u32, stat: &Stat, tty_nr: i32) -> bool {
+    stat.tty_nr == tty_nr && stat.state != 'Z' && pid > 1 && pid != std::process::id()
+}
+
+#[cfg(not(windows))]
+fn signal_terminal(tty_nr: i32, signal: libc::c_int) {
+    for (pid, start_time) in terminal_members(tty_nr) {
+        signal_pid(pid, start_time, signal);
+    }
+}
+
+#[cfg(not(windows))]
+fn signal_pid(pid: u32, start_time: u64, signal: libc::c_int) {
+    if identity_matches(pid, start_time) {
+        unsafe {
+            libc::kill(pid as libc::pid_t, signal);
         }
-        libc::kill(p, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(windows))]
+fn signal_process_tree(root: u32, signal: libc::c_int) {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let processes: Vec<(u32, Stat)> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(|pid| read_stat(pid).map(|stat| (pid, stat)))
+        .collect();
+    let mut members = HashSet::from([root]);
+    loop {
+        let before = members.len();
+        for (pid, stat) in &processes {
+            if members.contains(&stat.ppid) {
+                members.insert(*pid);
+            }
+        }
+        if members.len() == before {
+            break;
+        }
+    }
+    for (pid, stat) in processes {
+        if members.contains(&pid)
+            && stat.state != 'Z'
+            && pid > 1
+            && pid != std::process::id()
+        {
+            signal_pid(pid, stat.start_time, signal);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn proc_stat_start_time_survives_parentheses_in_process_name() {
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[1] = "4000";
+        fields[4] = "34819";
+        fields[19] = "987654";
+        let stat = parse_stat(&format!("4100 (claude ) worker) {}", fields.join(" "))).unwrap();
+
+        assert_eq!(stat.ppid, 4000);
+        assert_eq!(stat.tty_nr, 34819);
+        assert_eq!(stat.start_time, 987654);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn sibling_tty_is_not_part_of_the_selected_tab() {
+        let mut stat = Stat {
+            state: 'S',
+            ppid: 4000,
+            tty_nr: 34819,
+            start_time: 987654,
+        };
+
+        assert!(is_terminal_member(4100, &stat, 34819));
+        assert!(!is_terminal_member(4100, &stat, 34820));
+        assert!(!is_terminal_member(1, &stat, 34819));
+        assert!(!is_terminal_member(std::process::id(), &stat, 34819));
+
+        stat.state = 'Z';
+        assert!(!is_terminal_member(4100, &stat, 34819));
+    }
 
     #[test]
     fn command_line_wins_over_the_name() {
