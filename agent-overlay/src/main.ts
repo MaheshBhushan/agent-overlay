@@ -142,7 +142,7 @@ function cardHtml(s: AgentSession): string {
       <span class="session-id" title="Overlay session ID · ${esc(s.pane_id)}">${esc(s.session_id)}</span>
       <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
       ${srcTag}
-      <button class="kill" data-session="${esc(s.session_id)}" title="Kill session">✕</button>
+      <button class="kill" data-session="${esc(s.session_id)}" title="Close terminal tab">✕</button>
     </div>
     <div class="card-meta">
       <span class="card-path" title="${esc(s.cwd)}">${esc(s.cwd)}</span>
