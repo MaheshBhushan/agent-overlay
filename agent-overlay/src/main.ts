@@ -52,6 +52,21 @@ const AGENT_BADGE: Record<string, string> = {
 
 let sessions: AgentSession[] = [];
 
+// Human-facing identities for this overlay run. pane_id remains the backend
+// handle used to focus/close a session; this short label is only there so two
+// otherwise-identical agent tabs can be discussed and tracked unambiguously.
+const sessionIds = new Map<string, string>();
+let nextSessionId = 1;
+
+function sessionId(paneId: string): string {
+  let id = sessionIds.get(paneId);
+  if (!id) {
+    id = `AO-${String(nextSessionId++).padStart(2, "0")}`;
+    sessionIds.set(paneId, id);
+  }
+  return id;
+}
+
 const $ = <T extends HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
 
@@ -74,6 +89,9 @@ let prevStatus = new Map<string, string>();
 let primed = false; // skip sounds on the very first snapshot
 
 function updateSessions(next: AgentSession[]) {
+  // Allocate before rendering so a session keeps the same ID while moving
+  // between status columns on this or any later update.
+  for (const s of next) sessionId(s.pane_id);
   if (primed) {
     for (const s of next) {
       const before = prevStatus.get(s.pane_id);
