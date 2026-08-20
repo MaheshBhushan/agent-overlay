@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::claude_status;
-use crate::tmux::{agent_from_args, process_table, AgentSession};
+use crate::tmux::{agent_from_args, process_table, AgentSession, SessionTarget};
 
 /// CPU jiffies per poll that count as an "active" sample. Measured: idle
 /// agent TUIs burn 0–1 jiffies/s (cursor blink), actively-executing claude
@@ -238,6 +238,13 @@ mod win {
         })
     }
 
+    pub fn start_time(pid: u32) -> Option<u64> {
+        with_system(|sys, _| {
+            sys.process(sysinfo::Pid::from_u32(pid))
+                .map(|p| p.start_time())
+        })
+    }
+
     /// Is the process still present? Called immediately after a kill to decide
     /// whether it worked, so it must not answer from a snapshot taken before
     /// the kill — that would report a false failure for a successful kill.
@@ -383,6 +390,9 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
     for pid in &tops {
         let agent = matched[pid].clone();
         let cwd = read_cwd(*pid);
+        let Some(start_time) = process_start_time(*pid) else {
+            continue;
+        };
 
         let cpu = read_cpu_jiffies(*pid).unwrap_or(0);
         let entry = activity.entry(*pid).or_insert(ProcActivity {
@@ -419,6 +429,7 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
         };
 
         sessions.push(AgentSession {
+            session_id: String::new(),
             pane_id: format!("pid:{pid}"),
             session_name: "terminal".to_string(),
             window_index: "-".to_string(),
@@ -427,6 +438,10 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
             status,
             idle_secs,
             tail: Vec::new(),
+            target: SessionTarget::Process {
+                pid: *pid,
+                start_time,
+            },
         });
     }
 
@@ -463,9 +478,17 @@ fn read_cpu_jiffies(pid: u32) -> Option<u64> {
     Some(utime + stime)
 }
 
+/// Kernel process creation value. Linux returns clock ticks since boot;
+/// Windows returns sysinfo's process start timestamp. It is only compared on
+/// the same machine/backend, so the units do not need normalization.
+#[cfg(not(windows))]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    read_stat(pid).map(|s| s.start_time)
+}
+
 #[cfg(windows)]
-fn read_cpu_jiffies(pid: u32) -> Option<u64> {
-    win::cpu_jiffies(pid)
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    win::start_time(pid)
 }
 
 /// Terminate a non-tmux agent session by pid.
@@ -479,15 +502,22 @@ fn proc_comm(pid: u32) -> String {
 /// Fields we care about from /proc/<pid>/stat.
 #[cfg(not(windows))]
 struct Stat {
-    ppid: u32,
+    state: char,
+    pgrp: u32,
     session: u32,
     tty_nr: i32,
+    start_time: u64,
     comm: String,
 }
 
 #[cfg(not(windows))]
 fn read_stat(pid: u32) -> Option<Stat> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat(&s)
+}
+
+#[cfg(not(windows))]
+fn parse_stat(s: &str) -> Option<Stat> {
     // comm sits in parens and may itself contain spaces/parens, so span from the
     // first '(' to the last ')'. Remaining fields are whitespace-separated:
     //   [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr ...
@@ -496,80 +526,75 @@ fn read_stat(pid: u32) -> Option<Stat> {
     let comm = s.get(open + 1..close)?.to_string();
     let f: Vec<&str> = s.get(close + 2..)?.split_whitespace().collect();
     Some(Stat {
-        ppid: f.get(1)?.parse().ok()?,
+        state: f.first()?.chars().next()?,
+        pgrp: f.get(2)?.parse().ok()?,
         session: f.get(3)?.parse().ok()?,
         tty_nr: f.get(4)?.parse().ok()?,
+        // /proc stat field 22; `f` begins at field 3 (state).
+        start_time: f.get(19)?.parse().ok()?,
         comm,
     })
 }
 
-/// Find the terminal emulator hosting an agent — structurally, with no list of
-/// terminal names. A terminal opens a pty, then forks a child that calls
-/// setsid(): that child becomes the *session leader* and gains the pty as its
-/// controlling terminal, while the terminal emulator stays in its own, different
-/// session. So the emulator is precisely "the parent of the agent's session
-/// leader, living in a different session." This holds for konsole, alacritty,
-/// kitty, foot, xterm, gnome-terminal, sshd, … — anything that spawns a pty.
-///
-/// Returns None when there's no controlling terminal (headless / piped) or the
-/// candidate is a system process (pid 1, systemd, login), so we never nuke init.
+/// The controlling terminal's Unix session is the tab boundary. It contains
+/// the shell, agent and tool children, but not the terminal-emulator process or
+/// sibling tabs. Never climb to the emulator: one emulator commonly owns every
+/// tab in its window.
 #[cfg(not(windows))]
-fn hosting_terminal(agent: u32) -> Option<u32> {
+fn terminal_session(agent: u32) -> Option<u32> {
     let a = read_stat(agent)?;
-    if a.tty_nr == 0 {
-        return None; // no controlling terminal to speak of
-    }
-    let leader = read_stat(a.session)?; // the session leader (usually the shell)
-    let cand = leader.ppid; // its parent = the pty master side = the emulator
-    if cand <= 1 {
+    if a.tty_nr == 0 || a.session <= 1 {
         return None;
     }
-    let c = read_stat(cand)?;
-    // The real emulator is in a *different* session than the agent, and isn't a
-    // core system process.
-    if c.session == a.session {
-        return None;
-    }
-    if cand == std::process::id() || c.comm.starts_with("systemd") || c.comm == "init"
-        || c.comm == "login"
+    let leader = read_stat(a.session)?;
+    if leader.session != a.session
+        || leader.tty_nr != a.tty_nr
+        || a.session == std::process::id()
+        || leader.comm.starts_with("systemd")
+        || matches!(leader.comm.as_str(), "init" | "login")
     {
         return None;
     }
-    Some(cand)
+    Some(a.session)
 }
 
-pub fn kill(pid_handle: &str) -> Result<(), String> {
-    let pid: u32 = pid_handle
-        .strip_prefix("pid:")
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| format!("bad pid handle {pid_handle}"))?;
+pub fn kill(pid: u32, start_time: u64) -> Result<(), String> {
+    if !identity_matches(pid, start_time) {
+        return Err(format!("process identity for pid {pid} no longer matches"));
+    }
 
     #[cfg(not(windows))]
     {
-        let alive = |p: u32| std::path::Path::new(&format!("/proc/{p}")).exists();
-        match hosting_terminal(pid) {
-            Some(term) => {
-                eprintln!(
-                    "[kill] agent pid={pid} -> closing hosting terminal pid={term} comm={}",
-                    proc_comm(term)
-                );
-                kill_group_and_pid(term);
-            }
+        let session = terminal_session(pid);
+        match session {
+            Some(sid) => signal_session(sid, libc::SIGTERM),
             None => {
-                eprintln!("[kill] agent pid={pid}: no distinct terminal, killing agent group only");
+                signal_group_and_pid(pid, start_time, libc::SIGTERM);
             }
         }
-        // Always also take down the agent's own group, in case it ignores the
-        // pty hangup or was launched without a terminal.
-        kill_group_and_pid(pid);
 
         for _ in 0..20 {
-            if !alive(pid) {
+            let ended = match session {
+                Some(sid) => session_members(sid).is_empty(),
+                None => !identity_matches(pid, start_time),
+            };
+            if ended {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        return if alive(pid) {
+
+        match session {
+            Some(sid) => signal_session(sid, libc::SIGKILL),
+            None => signal_group_and_pid(pid, start_time, libc::SIGKILL),
+        }
+        for _ in 0..20 {
+            if !identity_matches(pid, start_time) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        return if identity_matches(pid, start_time) {
             Err(format!("failed to kill pid {pid}"))
         } else {
             Ok(())
@@ -582,18 +607,20 @@ pub fn kill(pid_handle: &str) -> Result<(), String> {
         // and kill its subtree — that's what makes the terminal close the tab,
         // exactly like typing `exit` (killing only the agent leaves the shell
         // alive and the window open).
-        win::close_agent(pid);
+        if !win::close_agent(pid, start_time) {
+            return Err(format!("process identity for pid {pid} no longer matches"));
+        }
         // TerminateProcess is asynchronous: the process stays in the table
         // until its threads reap, so a single immediate check reports a false
         // failure for a kill that did work. Same settle loop as the Linux
         // branch above.
         for _ in 0..20 {
-            if !win::alive(pid) {
+            if !win::identity_alive(pid, start_time) {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
-        if win::alive(pid) {
+        if win::identity_alive(pid, start_time) {
             Err(format!("failed to kill pid {pid}"))
         } else {
             Ok(())
@@ -601,23 +628,79 @@ pub fn kill(pid_handle: &str) -> Result<(), String> {
     }
 }
 
-/// SIGKILL a process group and the pid itself, via the raw syscall (no PATH
-/// dependency). Safe: kill/getpgid with a pid + signal have no memory effects.
+/// All live processes in one Unix login/pty session. Rescanned for escalation
+/// so children created after SIGTERM are still contained.
 #[cfg(not(windows))]
-fn kill_group_and_pid(pid: u32) {
-    let p = pid as libc::pid_t;
-    unsafe {
-        let pgid = libc::getpgid(p);
-        if pgid > 0 {
-            libc::kill(-pgid, libc::SIGKILL);
+fn session_members(sid: u32) -> Vec<(u32, u64)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(|pid| read_stat(pid).map(|stat| (pid, stat)))
+        .filter(|(pid, stat)| {
+            stat.session == sid
+                && stat.state != 'Z'
+                && *pid > 1
+                && *pid != std::process::id()
+        })
+        .map(|(pid, stat)| (pid, stat.start_time))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn signal_session(sid: u32, signal: libc::c_int) {
+    for (pid, start_time) in session_members(sid) {
+        signal_pid(pid, start_time, signal);
+    }
+}
+
+#[cfg(not(windows))]
+fn signal_pid(pid: u32, start_time: u64, signal: libc::c_int) {
+    if identity_matches(pid, start_time) {
+        unsafe {
+            libc::kill(pid as libc::pid_t, signal);
         }
-        libc::kill(p, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(windows))]
+fn signal_group_and_pid(pid: u32, start_time: u64, signal: libc::c_int) {
+    let Some(stat) = read_stat(pid).filter(|stat| stat.start_time == start_time) else {
+        return;
+    };
+    unsafe {
+        // Never signal the overlay's own group if a headless process happens to
+        // share it. The verified agent pid is still safe to signal directly.
+        if stat.pgrp > 1 && stat.pgrp != libc::getpgrp() as u32 {
+            libc::kill(-(stat.pgrp as libc::pid_t), signal);
+        }
+        libc::kill(pid as libc::pid_t, signal);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn proc_stat_start_time_survives_parentheses_in_process_name() {
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[2] = "4000";
+        fields[3] = "4000";
+        fields[4] = "34819";
+        fields[19] = "987654";
+        let stat = parse_stat(&format!("4100 (claude ) worker) {}", fields.join(" "))).unwrap();
+
+        assert_eq!(stat.comm, "claude ) worker");
+        assert_eq!(stat.pgrp, 4000);
+        assert_eq!(stat.session, 4000);
+        assert_eq!(stat.tty_nr, 34819);
+        assert_eq!(stat.start_time, 987654);
+    }
 
     #[test]
     fn command_line_wins_over_the_name() {

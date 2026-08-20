@@ -11,6 +11,8 @@ use crate::parser;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSession {
+    /// Stable, human-facing ID assigned by the backend for this process lifetime.
+    pub session_id: String,
     /// tmux pane id, e.g. "%3" — the handle used for send-keys/capture-pane.
     pub pane_id: String,
     pub session_name: String,
@@ -22,6 +24,51 @@ pub struct AgentSession {
     /// Seconds since the pane's output last changed; None while running.
     pub idle_secs: Option<u64>,
     pub tail: Vec<String>,
+    /// Authoritative action target. Never exposed to the webview.
+    #[serde(skip)]
+    pub target: SessionTarget,
+}
+
+/// A PID alone is reusable. Pair every process-backed target with the kernel's
+/// creation value so a stale card can never act on a replacement process.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum SessionTarget {
+    Tmux {
+        pane_id: String,
+        agent_pid: u32,
+        start_time: u64,
+    },
+    Process {
+        pid: u32,
+        start_time: u64,
+    },
+}
+
+impl SessionTarget {
+    pub fn handle(&self) -> String {
+        match self {
+            Self::Tmux { pane_id, .. } => pane_id.clone(),
+            Self::Process { pid, .. } => format!("pid:{pid}"),
+        }
+    }
+
+    pub fn identity_matches(&self) -> bool {
+        let (pid, start_time) = match self {
+            Self::Tmux {
+                agent_pid,
+                start_time,
+                ..
+            } => (*agent_pid, *start_time),
+            Self::Process { pid, start_time } => (*pid, *start_time),
+        };
+        crate::procscan::identity_matches(pid, start_time)
+    }
+
+    pub fn start_time(&self) -> u64 {
+        match self {
+            Self::Tmux { start_time, .. } | Self::Process { start_time, .. } => *start_time,
+        }
+    }
 }
 
 /// Known agent CLIs, matched against the pane command and its descendants.
@@ -214,6 +261,9 @@ pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
         let Some((agent, agent_pid)) = detect_agent(pid, cmd, &table) else {
             continue;
         };
+        let Some(start_time) = crate::procscan::process_start_time(agent_pid) else {
+            continue;
+        };
         seen.push(pane_id.to_string());
 
         let text = capture_pane(pane_id, 60);
@@ -255,6 +305,7 @@ pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
         };
 
         sessions.push(AgentSession {
+            session_id: String::new(),
             pane_id: pane_id.to_string(),
             session_name: session_name.to_string(),
             window_index: window_index.to_string(),
@@ -263,6 +314,11 @@ pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
             status,
             idle_secs,
             tail: parsed.tail,
+            target: SessionTarget::Tmux {
+                pane_id: pane_id.to_string(),
+                agent_pid,
+                start_time,
+            },
         });
     }
 
