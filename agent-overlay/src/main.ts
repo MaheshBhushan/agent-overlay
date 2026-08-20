@@ -426,7 +426,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     const el = e.target as HTMLElement;
     if (el.classList.contains("kill")) {
       const pane = el.dataset.pane;
-      if (pane && confirm("Close the whole terminal for this session?")) {
+      const label = pane ? sessionId(pane) : "this session";
+      if (pane && confirm(`Close the whole terminal for ${label}?`)) {
         // Tear down the backend FIRST (kill the process group), then unmount the
         // card. Removing it from state before a successful kill would orphan a
         // live session with no card. The `.exiting` class is a transient exit
