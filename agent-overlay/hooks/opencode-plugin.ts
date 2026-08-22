@@ -24,9 +24,11 @@ const post = (status: "running" | "idle" | "permission") => {
 
 export const AgentOverlay = async () => ({
   "tool.execute.before": async () => post("running"),
-  "permission.ask": async () => post("permission"),
-  event: async ({ event }: { event: { type: string } }) => {
+  event: async ({ event }: { event: { type: string; properties?: any } }) => {
+    if (event.type === "permission.asked") post("permission")
     if (event.type === "session.idle") post("idle")
-    if (event.type === "message.updated") post("running")
+    if (event.type === "session.status") {
+      post(event.properties?.status?.type === "idle" ? "idle" : "running")
+    }
   },
 })
