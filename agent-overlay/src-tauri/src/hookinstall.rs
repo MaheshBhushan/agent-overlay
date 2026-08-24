@@ -8,7 +8,7 @@
 //! | CLI      | target                                       | approval signal        |
 //! |----------|----------------------------------------------|------------------------|
 //! | claude   | `~/.claude/settings.json` (merged)           | `Notification`         |
-//! | codex    | `~/.codex/hooks/hooks.json` (merged)         | `permission_request`   |
+//! | codex    | `~/.codex/hooks/hooks.json` (merged)         | `permission-request`   |
 //! | opencode | `~/.config/opencode/plugin/agent-overlay.ts` | `permission.ask`       |
 //! | pi       | `~/.pi/agent/extensions/agent-overlay.ts`    | none (scraped)         |
 //!
@@ -36,10 +36,13 @@ use std::path::{Path, PathBuf};
 /// stopped installing `UserPromptSubmit`/`PreToolUse`/`Stop`.
 /// 3: `PreToolUse` and `Stop` are back — they are what end a sticky approval,
 /// which 2 broke.
+/// 4: opencode/pi report their process id, and command hooks repair executable
+/// paths accidentally installed with Linux's ` (deleted)` marker.
+/// 5: codex hook names use kebab-case, and `stop` reports idle immediately.
 ///
 /// First run short-circuits on the stamp, so each of those needed a bump to
 /// reach anyone already set up.
-pub const HOOKS_VERSION: &str = "3";
+pub const HOOKS_VERSION: &str = "5";
 
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode-plugin.ts");
 const PI_EXTENSION: &str = include_str!("../../hooks/pi-extension.ts");
@@ -131,9 +134,21 @@ fn event_command(status: &str) -> Result<String, String> {
 
 fn quoted_exe() -> Result<String, String> {
     let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
+        .map(|p| executable_path(&p))
         .unwrap_or_else(|_| "agent-overlay".into());
     quote_exe(&exe)
+}
+
+/// Linux exposes an unlinked running executable as `/path/app (deleted)`.
+/// An upgrade can replace the binary before the old overlay refreshes hooks;
+/// persisting that kernel-only suffix produces a command that never exists.
+fn executable_path(path: &Path) -> String {
+    let displayed = path.display().to_string();
+    displayed
+        .strip_suffix(" (deleted)")
+        .filter(|live| Path::new(live).exists())
+        .unwrap_or(&displayed)
+        .to_string()
 }
 
 /// Claude's `Notification` hook fires for more than approvals, so the decision
@@ -365,20 +380,23 @@ fn codex_path() -> Option<PathBuf> {
     Some(home()?.join(".codex").join("hooks").join("hooks.json"))
 }
 
-/// codex 0.144+ ships a Claude-shaped hooks system. `permission_request` is
-/// the exact approval signal; there is no turn-end event in its set, so idle
-/// comes from the running override expiring and the scraper taking back over.
+/// codex 0.144+ ships a Claude-shaped hooks system. `permission-request` is
+/// the exact approval signal, and `stop` reports the end of a turn.
 ///
 /// The event names and file layout are read off the shipped binary rather than
 /// public docs, so treat the schema as provisional: if a future codex renames
 /// these, the hooks simply never fire and the overlay degrades to scraping.
 fn codex_wanted() -> Result<Vec<(&'static str, Value)>, String> {
     Ok(vec![
-        ("user_prompt_submit", entry(event_command("running")?)),
-        ("pre_tool_use", entry(event_command("running")?)),
-        ("permission_request", entry(event_command("permission")?)),
+        ("user-prompt-submit", entry(event_command("running")?)),
+        ("pre-tool-use", entry(event_command("running")?)),
+        ("permission-request", entry(event_command("permission")?)),
+        ("stop", entry(event_command("idle")?)),
     ])
 }
+
+/// Names installed before codex exposed the public kebab-case event names.
+const CODEX_RETIRED: &[&str] = &["user_prompt_submit", "pre_tool_use", "permission_request"];
 
 fn opencode_path() -> Option<PathBuf> {
     Some(
@@ -519,7 +537,7 @@ pub fn status() -> Vec<CliHooks> {
         let path = codex_path();
         let wanted = codex_wanted();
         let note = match &wanted {
-            Ok(_) => "no turn-end event: idle falls back to scraping".to_string(),
+            Ok(_) => "running, idle and approvals are reported by hooks".to_string(),
             Err(e) => e.clone(),
         };
         // On a refusal there is nothing we could have installed — and an empty
@@ -530,13 +548,13 @@ pub fn status() -> Vec<CliHooks> {
             .as_deref()
             .and_then(|p| read_json_object(p).ok())
             .unwrap_or_default();
-        let installed = !refused && hooks_current(&doc, &wanted, &[]);
+        let installed = !refused && hooks_current(&doc, &wanted, CODEX_RETIRED);
         out.push(CliHooks {
             id: "codex",
             name: "OpenAI Codex CLI",
             present: cli_present(home().map(|h| h.join(".codex")), "codex"),
             installed,
-            outdated: !refused && !installed && hooks_present(&doc, &wanted, &[]),
+            outdated: !refused && !installed && hooks_present(&doc, &wanted, CODEX_RETIRED),
             path: path.map(|p| p.display().to_string()).unwrap_or_default(),
             exact_approval: true,
             note,
@@ -602,7 +620,7 @@ pub fn install_all() -> Vec<InstallOutcome> {
                     None => Err("no home directory".into()),
                 },
                 "codex" => match codex_path() {
-                    Some(p) => codex_wanted().and_then(|w| install_json(&p, &w, &[])),
+                    Some(p) => codex_wanted().and_then(|w| install_json(&p, &w, CODEX_RETIRED)),
                     None => Err("no home directory".into()),
                 },
                 "opencode" => match opencode_path() {
@@ -880,12 +898,40 @@ mod tests {
     fn a_bad_later_event_refuses_the_whole_file() {
         let dir = tmp("partial");
         let path = dir.join("hooks.json");
-        // user_prompt_submit is merged before permission_request is reached.
-        let original = r#"{"hooks":{"user_prompt_submit":[],"permission_request":"nope"}}"#;
+        // user-prompt-submit is merged before permission-request is reached.
+        let original = r#"{"hooks":{"user-prompt-submit":[],"permission-request":"nope"}}"#;
         std::fs::write(&path, original).unwrap();
 
-        assert!(install_json(&path, &codex_wanted().unwrap(), &[]).is_err());
+        assert!(install_json(&path, &codex_wanted().unwrap(), CODEX_RETIRED).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn codex_hooks_use_public_event_names_and_retire_old_ones() {
+        let dir = tmp("codex-events");
+        let path = dir.join("hooks.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"user_prompt_submit":[{"hooks":[{"type":"command","command":"agent-overlay --hook-event running"}]}]}}"#,
+        )
+        .unwrap();
+
+        install_json(&path, &codex_wanted().unwrap(), CODEX_RETIRED).unwrap();
+        let doc = read_json_object(&path).unwrap();
+        let hooks = doc["hooks"].as_object().unwrap();
+        for event in [
+            "user-prompt-submit",
+            "pre-tool-use",
+            "permission-request",
+            "stop",
+        ] {
+            assert!(hooks.contains_key(event), "missing {event}");
+        }
+        assert!(!hooks.contains_key("user_prompt_submit"));
+        assert!(hooks["stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("--hook-event idle"));
     }
 
     #[test]
@@ -1053,6 +1099,18 @@ mod tests {
         assert!(cmd.starts_with(quote), "exe path must be quoted: {cmd}");
         assert!(cmd.ends_with("--hook-event permission"));
         assert!(is_ours(&cmd));
+    }
+
+    #[test]
+    fn linux_deleted_marker_is_not_persisted_as_an_executable_name() {
+        let live = std::env::current_exe().unwrap();
+        let marked = PathBuf::from(format!("{} (deleted)", live.display()));
+        assert_eq!(executable_path(&marked), live.display().to_string());
+
+        // A real filename with that suffix is left alone.
+        let real = tmp("deleted-name").join("tool (deleted)");
+        std::fs::write(&real, "").unwrap();
+        assert_eq!(executable_path(&real), real.display().to_string());
     }
 
     /// The Windows refusal can only be exercised on Windows, but the decision

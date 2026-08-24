@@ -19,6 +19,9 @@ const post = (status: "running" | "idle" | "permission") => {
       // No tmux on Windows: pane is empty there and cwd is the only key.
       pane: proc?.env?.TMUX_PANE ?? "",
       cwd: proc?.cwd?.() ?? "",
+      // pi loads extensions in the session process, so this is also the
+      // overlay's per-tab process key outside tmux.
+      pids: proc?.pid ? [proc.pid] : [],
     }),
     signal: AbortSignal.timeout(2000),
   }).catch(() => {})

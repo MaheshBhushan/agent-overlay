@@ -11,6 +11,10 @@ const statuses = () => fetchMock.mock.calls.map(([_, init]) =>
   JSON.parse(String(init?.body)).status,
 )
 
+const payloads = () => fetchMock.mock.calls.map(([_, init]) =>
+  JSON.parse(String(init?.body)),
+)
+
 afterEach(() => fetchMock.mockClear())
 
 describe("OpenCode lifecycle events", () => {
@@ -28,5 +32,10 @@ describe("OpenCode lifecycle events", () => {
   test("reports approval requests", async () => {
     await hooks.event({ event: { type: "permission.asked" } })
     expect(statuses()).toEqual(["permission"])
+  })
+
+  test("identifies this terminal tab by process outside tmux", async () => {
+    await hooks.event({ event: { type: "session.idle" } })
+    expect(payloads()[0].pids).toEqual([process.pid])
   })
 })
