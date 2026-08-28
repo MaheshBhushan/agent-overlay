@@ -592,11 +592,11 @@ pub fn kill(pid: u32, start_time: u64) -> Result<(), String> {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        return if identity_matches(pid, start_time) {
+        if identity_matches(pid, start_time) {
             Err(format!("failed to kill pid {pid}"))
         } else {
             Ok(())
-        };
+        }
     }
 
     #[cfg(windows)]

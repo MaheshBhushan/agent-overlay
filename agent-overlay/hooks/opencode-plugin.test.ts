@@ -7,11 +7,11 @@ AbortSignal.timeout = () => new AbortController().signal
 const { AgentOverlay } = await import("./opencode-plugin")
 const hooks = await AgentOverlay()
 
-const statuses = () => fetchMock.mock.calls.map(([_, init]) =>
+const statuses = () => fetchMock.mock.calls.map(([, init]) =>
   JSON.parse(String(init?.body)).status,
 )
 
-const payloads = () => fetchMock.mock.calls.map(([_, init]) =>
+const payloads = () => fetchMock.mock.calls.map(([, init]) =>
   JSON.parse(String(init?.body)),
 )
 
