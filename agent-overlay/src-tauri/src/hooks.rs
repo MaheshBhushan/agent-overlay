@@ -18,12 +18,13 @@
 //! unrelated program has the port, in which case we carry on without hooks as
 //! before.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const PORT: u16 = 8377;
@@ -35,6 +36,10 @@ const EVENT_TTL_SECS: u64 = 120;
 /// answer and no further hook fires until they do. Any newer event
 /// (e.g. PreToolUse after approval) replaces it immediately.
 const PERMISSION_TTL_SECS: u64 = 1800;
+/// How long the overlay holds a `--hook-permission` request open. The hook
+/// entry's own timeout (hookinstall.rs) is longer, so the overlay always
+/// answers "no decision" before Claude kills the hook.
+const APPROVAL_WAIT_SECS: u64 = 570;
 
 #[derive(Deserialize)]
 struct HookEvent {
@@ -59,25 +64,24 @@ struct Entry {
 
 static STATE: Mutex<Option<HashMap<String, Entry>>> = Mutex::new(None);
 
-fn record(status: &str, pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) {
-    if !matches!(status, "running" | "idle" | "permission") {
-        return;
-    }
+/// A state key plus, for pid keys, the process creation value it was taken at.
+type Key = (String, Option<u64>);
+
+/// The keys an event from a hook is filed under.
+///
+/// A pane id or a pid names one session. `cwd` names a folder, and two agents
+/// working in one folder are a normal thing to do — so it is the last resort,
+/// used only when nothing precise is available. Writing it alongside a precise
+/// key is what used to put an idle sibling in the Needs Approval column next
+/// to the session actually waiting.
+fn event_keys(pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) -> Vec<Key> {
     let pane = pane.filter(|p| !p.is_empty()).map(str::to_string);
     let live_pids: Vec<(u32, u64)> = pids
         .iter()
         .filter_map(|pid| crate::procscan::process_start_time(*pid).map(|start| (*pid, start)))
         .collect();
-    // A pane id or a pid names one session. `cwd` names a folder, and two
-    // agents working in one folder are a normal thing to do — so it is the
-    // last resort, used only when nothing precise is available. Writing it
-    // alongside a precise key is what used to put an idle sibling in the
-    // Needs Approval column next to the session actually waiting.
     let precise = pane.is_some() || !live_pids.is_empty();
-    let mut guard = STATE.lock().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    let now = Instant::now();
-    let mut keys: Vec<(String, Option<u64>)> = pane.into_iter().map(|key| (key, None)).collect();
+    let mut keys: Vec<Key> = pane.into_iter().map(|key| (key, None)).collect();
     keys.extend(
         live_pids
             .into_iter()
@@ -86,6 +90,70 @@ fn record(status: &str, pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) {
     if let Some(cwd) = cwd.filter(|c| !c.is_empty() && !precise) {
         keys.push((format!("cwd:{cwd}"), None));
     }
+    keys
+}
+
+/// The keys that name the reporting session itself, for matching one hook
+/// request against another.
+///
+/// [`event_keys`] files a status under every ancestor pid, which is harmless
+/// for lookups: a session is only ever looked up by its own key. Comparing two
+/// events by those keys is not harmless. Two agents in sibling tabs share the
+/// terminal emulator's pid, so the tab that keeps working would cancel the
+/// approval pending in the other one. Only the pane and the agent's own pid
+/// identify a session.
+fn session_keys(pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) -> Vec<Key> {
+    only_agent_pid(event_keys(pane, cwd, pids), agent_pid(pids))
+}
+
+/// Drop every pid key but the agent's. With no agent among the pids (an agent
+/// CLI we don't recognise), keep them all: an approval that can collide with a
+/// sibling tab beats one that never shows up.
+fn only_agent_pid(keys: Vec<Key>, agent: Option<u32>) -> Vec<Key> {
+    let Some(agent) = agent else {
+        return keys;
+    };
+    let agent = format!("pid:{agent}");
+    keys.into_iter()
+        .filter(|(key, _)| !key.starts_with("pid:") || *key == agent)
+        .collect()
+}
+
+/// The first of `pids` whose command line is an agent CLI, matched the way
+/// procscan matches a session's own process.
+#[cfg(target_os = "linux")]
+fn agent_pid(pids: &[u32]) -> Option<u32> {
+    pids.iter().copied().find(|pid| {
+        std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| {
+            let args = String::from_utf8_lossy(&raw).replace('\0', " ");
+            crate::tmux::agent_from_args(&args).is_some()
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn agent_pid(_pids: &[u32]) -> Option<u32> {
+    None
+}
+
+fn record(status: &str, pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) {
+    if !matches!(status, "running" | "idle" | "permission") {
+        return;
+    }
+    // A running or idle event means the session moved on, so an approval it
+    // was waiting on was answered in the terminal (or the turn ended). Drop
+    // the overlay's copy so the card loses its buttons. A permission event is
+    // the same request announced again by `Notification`, so it keeps it.
+    if status != "permission" {
+        cancel_pending(&session_keys(pane, cwd, pids));
+    }
+    record_keys(status, event_keys(pane, cwd, pids));
+}
+
+fn record_keys(status: &str, keys: Vec<Key>) {
+    let mut guard = STATE.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
     for (key, start_time) in keys {
         map.insert(
             key,
@@ -119,6 +187,278 @@ pub fn override_for(pane_id: &str, cwd: &str, start_time: u64) -> Option<String>
         }
     }
     None
+}
+
+// ── approvals answered from the overlay ────────────────────────────────
+//
+// Claude Code's `PermissionRequest` hook runs alongside its own approval
+// dialog, and whichever answers first wins. The hook (`--hook-permission`)
+// posts the request here and holds the connection open. The card shows
+// Approve / Deny, and the user's click travels back down that connection as
+// the hook's decision. Answering in the terminal instead is always possible.
+// The session's next running/idle event then retires the request here.
+
+/// An approval the overlay can answer, as shown on the session's card.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Approval {
+    pub request_id: String,
+    pub tool: String,
+    pub summary: String,
+}
+
+struct Pending {
+    approval: Approval,
+    keys: Vec<Key>,
+    tx: mpsc::Sender<Decision>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Decision {
+    Allow,
+    Deny,
+    /// Nothing from the overlay; Claude's own dialog decides.
+    Pass,
+}
+
+static PENDING: Mutex<Vec<Pending>> = Mutex::new(Vec::new());
+static NEXT_APPROVAL: AtomicU64 = AtomicU64::new(1);
+
+fn keys_overlap(a: &[Key], b: &[Key]) -> bool {
+    a.iter().any(|k| b.contains(k))
+}
+
+/// Retire every pending request filed under one of `keys`, answering each
+/// hook with [`Decision::Pass`].
+fn cancel_pending(keys: &[Key]) {
+    cancel_in(&mut PENDING.lock().unwrap(), keys);
+}
+
+fn cancel_in(pending: &mut Vec<Pending>, keys: &[Key]) {
+    if keys.is_empty() {
+        return;
+    }
+    pending.retain(|p| {
+        let stale = keys_overlap(&p.keys, keys);
+        if stale {
+            let _ = p.tx.send(Decision::Pass);
+        }
+        !stale
+    });
+}
+
+fn add_pending(tool: String, summary: String, keys: Vec<Key>) -> (String, mpsc::Receiver<Decision>) {
+    let request_id = format!("AP-{}", NEXT_APPROVAL.fetch_add(1, Ordering::Relaxed));
+    let (tx, rx) = mpsc::channel();
+    // A new request from a session supersedes any older one: Claude has moved
+    // past the dialog that one belonged to. One lock for both steps, so no
+    // refresh in between sees the session with no request at all.
+    let mut pending = PENDING.lock().unwrap();
+    cancel_in(&mut pending, &keys);
+    pending.push(Pending {
+        approval: Approval {
+            request_id: request_id.clone(),
+            tool,
+            summary,
+        },
+        keys,
+        tx,
+    });
+    (request_id, rx)
+}
+
+fn remove_pending(request_id: &str) {
+    PENDING
+        .lock()
+        .unwrap()
+        .retain(|p| p.approval.request_id != request_id);
+}
+
+/// The approval waiting on this session, if the overlay can answer it.
+/// Looked up the same way as [`override_for`].
+pub fn approval_for(pane_id: &str, cwd: &str, start_time: u64) -> Option<Approval> {
+    let pending = PENDING.lock().unwrap();
+    let wanted = [pane_id.to_string(), format!("cwd:{cwd}")];
+    pending
+        .iter()
+        .rev()
+        .find(|p| {
+            p.keys.iter().any(|(key, recorded)| {
+                wanted.contains(key) && recorded.is_none_or(|r| r == start_time)
+            })
+        })
+        .map(|p| p.approval.clone())
+}
+
+/// Send the user's answer to the hook holding `request_id`.
+pub fn answer(request_id: &str, allow: bool) -> Result<(), String> {
+    let pending = {
+        let mut all = PENDING.lock().unwrap();
+        let i = all
+            .iter()
+            .position(|p| p.approval.request_id == request_id)
+            .ok_or_else(|| format!("approval {request_id} was already answered"))?;
+        all.remove(i)
+    };
+    pending
+        .tx
+        .send(if allow { Decision::Allow } else { Decision::Deny })
+        .map_err(|_| format!("approval {request_id} was already answered"))?;
+    // Nothing else reports that the dialog closed: the next hook is the
+    // following tool's PreToolUse or the turn's Stop. Leave the card in Needs
+    // Approval until then and it looks as if the click did nothing.
+    record_keys("running", pending.keys);
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct PermissionRequest {
+    pane: Option<String>,
+    cwd: Option<String>,
+    #[serde(default)]
+    pids: Vec<u32>,
+    #[serde(default)]
+    tool: String,
+    #[serde(default)]
+    summary: String,
+}
+
+/// Has the hook on the other end hung up? Claude may kill it once the
+/// terminal dialog is answered, and a request nobody is waiting on must not
+/// keep its buttons.
+fn peer_closed(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let closed = match stream.peek(&mut [0u8; 1]) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+    };
+    let _ = stream.set_nonblocking(false);
+    closed
+}
+
+/// Hold a `POST /permission` open until the user decides, the session moves
+/// on, the hook hangs up, or [`APPROVAL_WAIT_SECS`] pass.
+fn await_decision(stream: &TcpStream, req: PermissionRequest) -> Decision {
+    let pane = req.pane.as_deref();
+    let cwd = req.cwd.as_deref();
+    record("permission", pane, cwd, &req.pids);
+    let (request_id, rx) = add_pending(req.tool, req.summary, session_keys(pane, cwd, &req.pids));
+    let deadline = Instant::now() + Duration::from_secs(APPROVAL_WAIT_SECS);
+    let decision = loop {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(decision) => break decision,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Decision::Pass,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline || peer_closed(stream) {
+                    break Decision::Pass;
+                }
+            }
+        }
+    };
+    remove_pending(&request_id);
+    decision
+}
+
+/// The `--hook-permission` path: Claude Code's `PermissionRequest` hook.
+/// Returns what the hook should print on stdout, or `None` to print nothing
+/// and leave the decision to Claude's own dialog. With no overlay running it
+/// returns `None` at once.
+pub fn request_permission(payload: &str) -> Option<String> {
+    let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    send_permission(PORT, &permission_body(payload, &pane, &ancestor_pids()))
+}
+
+/// The `POST /permission` body for the hook payload Claude wrote on stdin.
+fn permission_body(payload: &str, pane: &str, pids: &[u32]) -> String {
+    let input: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    let tool = input
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_string();
+    let summary = permission_summary(&tool, input.get("tool_input").unwrap_or(&Value::Null));
+    let cwd = input
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
+        .unwrap_or_default();
+    serde_json::json!({
+        "pane": pane,
+        "cwd": cwd,
+        "pids": pids,
+        "tool": tool,
+        "summary": summary,
+    })
+    .to_string()
+}
+
+/// Post a permission request and wait for the overlay's answer. Returns the
+/// hook's stdout for a decision, or `None` for none.
+fn send_permission(port: u16, body: &str) -> Option<String> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut c = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+    let _ = c.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = c.set_read_timeout(Some(Duration::from_secs(APPROVAL_WAIT_SECS + 10)));
+    c.write_all(
+        format!(
+            "POST /permission HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .as_bytes(),
+    )
+    .ok()?;
+    let mut resp = String::new();
+    c.read_to_string(&mut resp).ok()?;
+    let (head, decision) = resp.split_once("\r\n\r\n")?;
+    if !head.to_ascii_lowercase().contains(&MARKER.to_ascii_lowercase()) {
+        return None;
+    }
+    let decision = match decision.trim() {
+        "allow" => serde_json::json!({ "behavior": "allow" }),
+        "deny" => serde_json::json!({
+            "behavior": "deny",
+            "message": "The user denied this from Agent Overlay.",
+        }),
+        _ => return None,
+    };
+    Some(
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": decision,
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// One line saying what the tool wants to do: the command for Bash, the path
+/// for file tools, and the input itself for anything unrecognised.
+fn permission_summary(tool: &str, input: &Value) -> String {
+    let field = |name: &str| input.get(name).and_then(Value::as_str).map(str::to_string);
+    let text = match tool {
+        "Bash" => field("command"),
+        "Edit" | "MultiEdit" | "Write" | "Read" => field("file_path"),
+        "NotebookEdit" => field("notebook_path"),
+        "WebFetch" => field("url"),
+        "WebSearch" => field("query"),
+        "Glob" | "Grep" => field("pattern"),
+        _ => None,
+    }
+    .unwrap_or_else(|| match input {
+        Value::Null => String::new(),
+        other => other.to_string(),
+    });
+    const MAX: usize = 400;
+    match text.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
 }
 
 /// Identifies our own responses, so a second launch can tell an overlay from
@@ -281,6 +621,29 @@ fn handle(stream: TcpStream, on_show: &dyn Fn()) -> Option<()> {
     }
 
     let show = path == "/show" && method.eq_ignore_ascii_case("POST") && !from_browser;
+    if path == "/permission" {
+        let mut stream = reader.into_inner();
+        // A web page must never get to approve anything; answer it "no
+        // decision" without registering the request.
+        let decision = match serde_json::from_slice::<PermissionRequest>(&body) {
+            Ok(req) if !from_browser => await_decision(&stream, req),
+            _ => Decision::Pass,
+        };
+        let body = match decision {
+            Decision::Allow => "allow",
+            Decision::Deny => "deny",
+            Decision::Pass => "pass",
+        };
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\n{MARKER}: 1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = stream.flush();
+        return Some(());
+    }
     if path != "/show" && !from_browser {
         if let Ok(ev) = serde_json::from_slice::<HookEvent>(&body) {
             record(&ev.status, ev.pane.as_deref(), ev.cwd.as_deref(), &ev.pids);
@@ -753,6 +1116,165 @@ mod tests {
             stalled_resp.starts_with("HTTP/1.1 204"),
             "stalled request got no response: {stalled_resp:?}"
         );
+    }
+
+    // ── approvals ──────────────────────────────────────────────────
+
+    /// Start a listener and raise a permission request from `pane` on a
+    /// thread, the way `--hook-permission` would. Returns the hook's eventual
+    /// stdout. Each test uses its own pane: the pending list is global.
+    fn raise_request(
+        pane: &'static str,
+        payload: &'static str,
+    ) -> std::thread::JoinHandle<Option<String>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        serve(listener, || {});
+        let hook = std::thread::spawn(move || {
+            send_permission(port, &permission_body(payload, pane, &[]))
+        });
+        wait_until(
+            || approval_for(pane, "", 0).is_some(),
+            "request never reached the overlay",
+        );
+        hook
+    }
+
+    const BASH_PAYLOAD: &str =
+        r#"{"tool_name":"Bash","tool_input":{"command":"npm test"},"cwd":"/tmp/approval-test"}"#;
+
+    #[test]
+    fn an_approval_from_the_overlay_reaches_the_hook() {
+        let hook = raise_request("%7101", BASH_PAYLOAD);
+        let approval = approval_for("%7101", "", 0).unwrap();
+        assert_eq!(approval.tool, "Bash");
+        assert_eq!(approval.summary, "npm test");
+        assert_eq!(override_for("%7101", "").as_deref(), Some("permission"));
+
+        answer(&approval.request_id, true).unwrap();
+        let out: Value = serde_json::from_str(&hook.join().unwrap().unwrap()).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        assert_eq!(out["hookSpecificOutput"]["decision"]["behavior"], "allow");
+
+        // The card leaves Needs Approval at once instead of waiting for the
+        // session's next hook.
+        assert_eq!(approval_for("%7101", "", 0), None);
+        assert_eq!(override_for("%7101", "").as_deref(), Some("running"));
+        assert!(answer(&approval.request_id, true).is_err(), "answered twice");
+    }
+
+    #[test]
+    fn a_denial_from_the_overlay_reaches_the_hook() {
+        let hook = raise_request("%7102", BASH_PAYLOAD);
+        let approval = approval_for("%7102", "", 0).unwrap();
+        answer(&approval.request_id, false).unwrap();
+        let out: Value = serde_json::from_str(&hook.join().unwrap().unwrap()).unwrap();
+        let decision = &out["hookSpecificOutput"]["decision"];
+        assert_eq!(decision["behavior"], "deny");
+        assert!(decision["message"].as_str().unwrap().contains("Agent Overlay"));
+    }
+
+    /// Answered in the terminal instead: the session's next event retires the
+    /// request, and the hook exits printing nothing.
+    #[test]
+    fn the_next_event_retires_an_open_request() {
+        let hook = raise_request("%7103", BASH_PAYLOAD);
+        // Notification announces the same request again; that keeps it.
+        record("permission", Some("%7103"), None, &[]);
+        assert!(approval_for("%7103", "", 0).is_some());
+
+        record("running", Some("%7103"), None, &[]);
+        assert_eq!(hook.join().unwrap(), None);
+        assert_eq!(approval_for("%7103", "", 0), None);
+    }
+
+    #[test]
+    fn a_new_request_supersedes_the_old_one() {
+        let first = raise_request("%7104", BASH_PAYLOAD);
+        let old = approval_for("%7104", "", 0).unwrap();
+        let second = raise_request("%7104", BASH_PAYLOAD);
+        assert_eq!(first.join().unwrap(), None, "the stale hook kept waiting");
+        let new = approval_for("%7104", "", 0).unwrap();
+        assert_ne!(old.request_id, new.request_id);
+        answer(&new.request_id, true).unwrap();
+        assert!(second.join().unwrap().is_some());
+    }
+
+    /// An unrelated session must not get, or clear, this one's buttons.
+    #[test]
+    fn a_request_belongs_to_its_own_session() {
+        let hook = raise_request("%7105", BASH_PAYLOAD);
+        assert_eq!(approval_for("%7106", "/tmp/approval-test", 0), None);
+        record("running", Some("%7106"), None, &[]);
+        let approval = approval_for("%7105", "", 0).expect("a sibling cleared it");
+        answer(&approval.request_id, true).unwrap();
+        hook.join().unwrap();
+    }
+
+    #[test]
+    fn requesting_with_no_overlay_is_immediate_and_silent() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let started = Instant::now();
+        assert_eq!(send_permission(port, &permission_body(BASH_PAYLOAD, "%7107", &[])), None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_browser_cannot_raise_a_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        serve(listener, || {});
+        let body = permission_body(BASH_PAYLOAD, "%7108", &[]);
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.write_all(
+            format!(
+                "POST /permission HTTP/1.1\r\nOrigin: https://evil.example\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).unwrap();
+        assert!(resp.ends_with("pass"), "{resp}");
+        assert_eq!(approval_for("%7108", "", 0), None);
+    }
+
+    /// Sibling tabs share the terminal emulator's pid. Only the agent's own
+    /// pid may identify the session an approval belongs to.
+    #[test]
+    fn only_the_agent_pid_names_a_session() {
+        let keys = vec![
+            ("%1".to_string(), None),
+            ("pid:10".to_string(), Some(1)),
+            ("pid:20".to_string(), Some(2)),
+        ];
+        assert_eq!(
+            only_agent_pid(keys.clone(), Some(20)),
+            vec![("%1".to_string(), None), ("pid:20".to_string(), Some(2))]
+        );
+        assert_eq!(only_agent_pid(keys.clone(), None), keys);
+    }
+
+    #[test]
+    fn summaries_name_what_the_tool_will_touch() {
+        let input = |v: &str| serde_json::from_str::<Value>(v).unwrap();
+        assert_eq!(permission_summary("Bash", &input(r#"{"command":"ls -la"}"#)), "ls -la");
+        assert_eq!(
+            permission_summary("Edit", &input(r#"{"file_path":"/a/b.rs","old_string":"x"}"#)),
+            "/a/b.rs"
+        );
+        assert_eq!(
+            permission_summary("mcp__x__y", &input(r#"{"q":1}"#)),
+            r#"{"q":1}"#
+        );
+        let long = format!(r#"{{"command":"{}"}}"#, "é".repeat(500));
+        let cut = permission_summary("Bash", &input(&long));
+        assert_eq!(cut.chars().count(), 401);
+        assert!(cut.ends_with('…'));
     }
 
     fn wait_until(cond: impl Fn() -> bool, msg: &str) {

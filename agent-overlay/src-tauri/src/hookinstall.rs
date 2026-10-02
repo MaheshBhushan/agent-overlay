@@ -7,7 +7,7 @@
 //!
 //! | CLI      | target                                       | approval signal        |
 //! |----------|----------------------------------------------|------------------------|
-//! | claude   | `~/.claude/settings.json` (merged)           | `Notification`         |
+//! | claude   | `~/.claude/settings.json` (merged)           | `PermissionRequest`    |
 //! | codex    | `~/.codex/hooks/hooks.json` (merged)         | `permission-request`   |
 //! | opencode | `~/.config/opencode/plugin/agent-overlay.ts` | `permission.ask`       |
 //! | pi       | `~/.pi/agent/extensions/agent-overlay.ts`    | none (scraped)         |
@@ -39,10 +39,12 @@ use std::path::{Path, PathBuf};
 /// 4: opencode/pi report their process id, and command hooks repair executable
 /// paths accidentally installed with Linux's ` (deleted)` marker.
 /// 5: codex hook names use kebab-case, and `stop` reports idle immediately.
+/// 6: claude gets a `PermissionRequest` hook, so approvals can be answered
+/// from the overlay.
 ///
 /// First run short-circuits on the stamp, so each of those needed a bump to
 /// reach anyone already set up.
-pub const HOOKS_VERSION: &str = "5";
+pub const HOOKS_VERSION: &str = "6";
 
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode-plugin.ts");
 const PI_EXTENSION: &str = include_str!("../../hooks/pi-extension.ts");
@@ -165,7 +167,21 @@ fn notify_command() -> Result<String, String> {
 /// the older hand-merged `curl` payload from the README, which is what most
 /// existing users have and is broken on Windows.
 fn is_ours(cmd: &str) -> bool {
-    cmd.contains("--hook-event") || cmd.contains("--hook-notify") || cmd.contains("127.0.0.1:8377")
+    cmd.contains("--hook-event")
+        || cmd.contains("--hook-notify")
+        || cmd.contains("--hook-permission")
+        || cmd.contains("127.0.0.1:8377")
+}
+
+/// Claude's `PermissionRequest` hook. It blocks until the user answers on the
+/// overlay, so it needs a timeout longer than the overlay's own wait
+/// (hooks::APPROVAL_WAIT_SECS). Claude's dialog stays usable meanwhile.
+fn permission_entry() -> Result<Value, String> {
+    Ok(json!({ "hooks": [{
+        "type": "command",
+        "command": format!("{} --hook-permission", quoted_exe()?),
+        "timeout": 600,
+    }] }))
 }
 
 /// One Claude/codex-shaped hook entry: `{"hooks":[{"type":"command",…}]}`.
@@ -347,6 +363,8 @@ fn claude_path() -> Option<PathBuf> {
 /// UserPromptSubmit/PreToolUse → running, Notification → permission,
 /// Stop → idle.
 /// `Notification` reports the approval; `PreToolUse` and `Stop` end it.
+/// `PermissionRequest` also reports it, and carries the user's answer back
+/// when they decide on the overlay.
 ///
 /// Claude's running/idle come from its own per-pid session file, which is
 /// authoritative, so `discover_sessions` throws away hook-reported running/idle
@@ -368,6 +386,7 @@ fn claude_wanted() -> Result<Vec<(&'static str, Value)>, String> {
     Ok(vec![
         ("PreToolUse", entry(event_command("running")?)),
         ("Notification", entry(notify_command()?)),
+        ("PermissionRequest", permission_entry()?),
         ("Stop", entry(event_command("idle")?)),
     ])
 }

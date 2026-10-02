@@ -19,6 +19,14 @@ interface AgentSession {
   status: string;
   idle_secs: number | null;
   tail: string[];
+  approval: Approval | null;
+}
+
+/// Mirrors hooks::Approval — a request the overlay can answer.
+interface Approval {
+  request_id: string;
+  tool: string;
+  summary: string;
 }
 
 /// Mirrors hookinstall::CliHooks — status-hook state for one agent CLI.
@@ -122,12 +130,20 @@ function fmtDuration(secs: number): string {
   return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }
 
-function cardHtml(s: AgentSession): string {
+function headHtml(s: AgentSession): string {
   const inTmux = !s.pane_id.startsWith("pid:");
   const srcTag = inTmux
     ? ""
     : `<span class="term-tag" title="Plain terminal (not tmux)">term</span>`;
   const badge = AGENT_BADGE[s.agent] ?? s.agent.slice(0, 2).toUpperCase();
+  return `<span class="agent-badge">${esc(badge)}</span>
+      <span class="session-id" title="Overlay session ID · ${esc(s.pane_id)}">${esc(s.session_id)}</span>
+      <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
+      ${srcTag}
+      <button class="kill" data-session="${esc(s.session_id)}" title="Close terminal tab">✕</button>`;
+}
+
+function bodyHtml(s: AgentSession): string {
   const idleTag = s.status === "permission"
     ? `<span class="card-perm">⚠ approval needed${s.idle_secs != null ? " · " + fmtDuration(s.idle_secs) : ""}</span>`
     : s.idle_secs != null
@@ -137,20 +153,93 @@ function cardHtml(s: AgentSession): string {
     : "";
   const tailText = s.tail.slice(-2).join("\n").trim();
 
-  return `<div class="card" data-session="${esc(s.session_id)}" title="Double-click to open terminal">
-    <div class="card-head">
-      <span class="agent-badge">${esc(badge)}</span>
-      <span class="session-id" title="Overlay session ID · ${esc(s.pane_id)}">${esc(s.session_id)}</span>
-      <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
-      ${srcTag}
-      <button class="kill" data-session="${esc(s.session_id)}" title="Close terminal tab">✕</button>
-    </div>
-    <div class="card-meta">
+  return `<div class="card-meta">
       <span class="card-path" title="${esc(s.cwd)}">${esc(s.cwd)}</span>
       ${idleTag}
     </div>
-    ${tailText ? `<div class="card-tail">${esc(tailText)}</div>` : ""}
-  </div>`;
+    ${tailText ? `<div class="card-tail">${esc(tailText)}</div>` : ""}`;
+}
+
+/// Approve / Deny for a request the overlay can answer. The markup depends on
+/// the request alone, so the once-a-second refresh never replaces the buttons
+/// while a request is open.
+function actionsHtml(s: AgentSession): string {
+  const a = s.approval;
+  if (!a) return "";
+  const req = esc(a.request_id);
+  return `<div class="approval">
+      <div class="approval-what" title="${esc(a.summary)}">
+        <span class="approval-tool">${esc(a.tool)}</span>
+        <code class="approval-summary">${esc(a.summary)}</code>
+      </div>
+      <div class="approval-buttons">
+        <button class="approve" data-request="${req}">Approve</button>
+        <button class="deny" data-request="${req}">Deny</button>
+        <span class="approval-error"></span>
+      </div>
+    </div>`;
+}
+
+// Last markup written into each card part, so unchanged parts are left alone.
+const writtenHtml = new WeakMap<Element, string>();
+
+function setHtml(el: Element, html: string) {
+  if (writtenHtml.get(el) === html) return;
+  el.innerHTML = html;
+  writtenHtml.set(el, html);
+}
+
+/// Bring one column's cards in line with `list`, keeping each session's card
+/// element across refreshes. Rebuilding the column every second would drop a
+/// click whose press and release straddle a refresh, break double-click, and
+/// flicker tooltips. Each card has three parts patched separately: the idle
+/// timer ticks every second, and that must not touch the buttons.
+function patchColumn(container: HTMLElement, list: AgentSession[]) {
+  const existing = new Map<string, HTMLElement>();
+  for (const el of Array.from(container.children) as HTMLElement[]) {
+    existing.set(el.dataset.session ?? "", el);
+  }
+  const wanted = new Set(list.map((s) => s.session_id));
+  for (const [id, el] of existing) {
+    if (!wanted.has(id)) el.remove();
+  }
+  list.forEach((s, i) => {
+    let card = existing.get(s.session_id);
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "card";
+      card.dataset.session = s.session_id;
+      card.title = "Double-click to open terminal";
+      card.innerHTML =
+        `<div class="card-head"></div><div class="card-body"></div><div class="card-actions"></div>`;
+    }
+    const [head, body, actions] = Array.from(card.children);
+    setHtml(head, headHtml(s));
+    setHtml(body, bodyHtml(s));
+    setHtml(actions, actionsHtml(s));
+    if (container.children[i] !== card) {
+      container.insertBefore(card, container.children[i] ?? null);
+    }
+  });
+}
+
+/// Send the user's answer for the request behind `button`. The card leaves
+/// Needs Approval on the next refresh once the backend has passed the answer
+/// to the waiting hook.
+function answerApproval(button: HTMLElement, allow: boolean) {
+  const requestId = button.dataset.request;
+  const box = button.closest(".approval");
+  if (!requestId || !box) return;
+  const buttons = Array.from(box.querySelectorAll("button"));
+  const error = box.querySelector(".approval-error") as HTMLElement;
+  buttons.forEach((b) => (b.disabled = true));
+  error.textContent = allow ? "approving…" : "denying…";
+  invoke("answer_approval", { requestId, allow }).catch((err) => {
+    // Most often it was answered in the terminal a moment earlier, and the
+    // next refresh removes the buttons anyway.
+    error.textContent = String(err);
+    buttons.forEach((b) => (b.disabled = false));
+  });
 }
 
 function render() {
@@ -165,9 +254,9 @@ function render() {
   empty.classList.toggle("hidden", sessions.length > 0);
   board.classList.toggle("hidden", sessions.length === 0);
 
-  $("#cards-running").innerHTML    = running.map(cardHtml).join("");
-  $("#cards-idle").innerHTML       = idle.map(cardHtml).join("");
-  $("#cards-permission").innerHTML = perms.map(cardHtml).join("");
+  patchColumn($("#cards-running"), running);
+  patchColumn($("#cards-idle"), idle);
+  patchColumn($("#cards-permission"), perms);
 
   $("#count-running").textContent    = String(running.length);
   $("#count-idle").textContent       = String(idle.length);
@@ -409,6 +498,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   document.body.addEventListener("click", (e) => {
     const el = e.target as HTMLElement;
+    if (el.classList.contains("approve") || el.classList.contains("deny")) {
+      answerApproval(el, el.classList.contains("approve"));
+      return;
+    }
     if (el.classList.contains("kill")) {
       const sessionId = el.dataset.session;
       if (sessionId && confirm(`Close the terminal tab for ${sessionId}?`)) {
@@ -434,7 +527,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   document.body.addEventListener("dblclick", (e) => {
     const card = (e.target as HTMLElement).closest(".card") as HTMLElement | null;
-    if (!card?.dataset.session || (e.target as HTMLElement).classList.contains("kill")) return;
+    if (!card?.dataset.session || (e.target as HTMLElement).closest("button, .approval")) return;
     invoke("focus_session", { sessionId: card.dataset.session }).catch((err) =>
       alert(`Could not open terminal: ${err}`)
     );
