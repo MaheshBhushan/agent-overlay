@@ -20,6 +20,8 @@ interface AgentSession {
   idle_secs: number | null;
   tail: string[];
   approval: Approval | null;
+  /// Finished work the user hasn't looked at yet (attention.rs).
+  finished: boolean;
 }
 
 /// Mirrors hooks::Approval — a request the overlay can answer.
@@ -60,6 +62,7 @@ const AGENT_BADGE: Record<string, string> = {
 };
 
 let sessions: AgentSession[] = [];
+let seenTimer: number | undefined; // pending single-click "seen it", see the click handler
 let killingAll = false;
 
 const $ = <T extends HTMLElement>(sel: string) =>
@@ -144,7 +147,9 @@ function headHtml(s: AgentSession): string {
 }
 
 function bodyHtml(s: AgentSession): string {
-  const idleTag = s.status === "permission"
+  const idleTag = s.finished
+    ? `<span class="card-done" title="Click the card once you've seen it">✓ finished${s.idle_secs != null ? " " + fmtDuration(s.idle_secs) + " ago" : ""}</span>`
+    : s.status === "permission"
     ? `<span class="card-perm">⚠ approval needed${s.idle_secs != null ? " · " + fmtDuration(s.idle_secs) : ""}</span>`
     : s.idle_secs != null
     ? `<span class="card-idle">idle ${fmtDuration(s.idle_secs)}</span>`
@@ -213,6 +218,7 @@ function patchColumn(container: HTMLElement, list: AgentSession[]) {
       card.innerHTML =
         `<div class="card-head"></div><div class="card-body"></div><div class="card-actions"></div>`;
     }
+    card.classList.toggle("finished", s.finished);
     const [head, body, actions] = Array.from(card.children);
     setHtml(head, headHtml(s));
     setHtml(body, bodyHtml(s));
@@ -242,13 +248,28 @@ function answerApproval(button: HTMLElement, allow: boolean) {
   });
 }
 
+/// Clear a session's finished flag. Shown at once; the backend confirms it on
+/// the next refresh.
+function markSeen(sessionId: string) {
+  if (!sessionId) return;
+  invoke("mark_seen", { sessionId }).catch(() => { /* next refresh shows the truth */ });
+  updateSessions(sessions.map((s) =>
+    s.session_id === sessionId ? { ...s, finished: false } : s));
+}
+
 function render() {
   const badge      = $("#status-badge");
   const empty      = $("#empty");
   const board      = $("#board");
 
   const running = sessions.filter(s => s.status === "running");
-  const idle    = sessions.filter(s => s.status === "idle");
+  // Finished-and-unseen first, most recent at the top: those are the idle
+  // sessions that want you. Long-idle ones keep their discovery order below.
+  const idle    = sessions
+    .filter(s => s.status === "idle")
+    .sort((a, b) => Number(b.finished) - Number(a.finished)
+      || (a.finished ? (a.idle_secs ?? 0) - (b.idle_secs ?? 0) : 0));
+  const done    = idle.filter(s => s.finished).length;
   const perms   = sessions.filter(s => s.status === "permission");
 
   empty.classList.toggle("hidden", sessions.length > 0);
@@ -264,6 +285,8 @@ function render() {
 
   badge.textContent = perms.length > 0
     ? `${perms.length} need approval · ${running.length} running`
+    : done > 0
+    ? `${done} finished · ${running.length} running`
     : `${running.length} running · ${idle.length} idle`;
   badge.classList.toggle("hidden", sessions.length === 0);
   badge.classList.toggle("all-idle",
@@ -275,6 +298,8 @@ function render() {
   $("#pill-idle").textContent       = String(idle.length);
   $("#pill-permission").textContent = String(perms.length);
   $("#pill-perm-wrap").classList.toggle("hidden", perms.length === 0);
+  $("#pill-done").textContent = String(done);
+  $("#pill-done-wrap").classList.toggle("hidden", done === 0);
   $("#pill").classList.toggle("alert", perms.length > 0);
 }
 
@@ -502,6 +527,15 @@ window.addEventListener("DOMContentLoaded", async () => {
       answerApproval(el, el.classList.contains("approve"));
       return;
     }
+    // A click anywhere else on a finished card says "seen it". Wait out the
+    // double-click interval first: marking it seen re-sorts the column, and
+    // the card must not move away from under a double-click's second press.
+    const doneCard = el.closest(".card.finished") as HTMLElement | null;
+    if (doneCard && !el.closest("button, .approval")) {
+      const id = doneCard.dataset.session ?? "";
+      clearTimeout(seenTimer);
+      seenTimer = window.setTimeout(() => markSeen(id), 350);
+    }
     if (el.classList.contains("kill")) {
       const sessionId = el.dataset.session;
       if (sessionId && confirm(`Close the terminal tab for ${sessionId}?`)) {
@@ -528,9 +562,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.body.addEventListener("dblclick", (e) => {
     const card = (e.target as HTMLElement).closest(".card") as HTMLElement | null;
     if (!card?.dataset.session || (e.target as HTMLElement).closest("button, .approval")) return;
-    invoke("focus_session", { sessionId: card.dataset.session }).catch((err) =>
-      alert(`Could not open terminal: ${err}`)
-    );
+    clearTimeout(seenTimer);
+    const sessionId = card.dataset.session;
+    invoke("focus_session", { sessionId })
+      // The backend marks a focused session seen; show it without waiting.
+      .then(() => markSeen(sessionId))
+      .catch((err) => alert(`Could not open terminal: ${err}`));
   });
 
   // ─ collapses the panel back to the pill.

@@ -26,6 +26,8 @@ pub struct AgentSession {
     pub tail: Vec<String>,
     /// An approval the overlay can answer for this session (hooks.rs).
     pub approval: Option<crate::hooks::Approval>,
+    /// Finished work the user hasn't looked at yet (attention.rs).
+    pub finished: bool,
     /// Authoritative action target. Never exposed to the webview.
     #[serde(skip)]
     pub target: SessionTarget,
@@ -311,6 +313,7 @@ pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
             idle_secs,
             tail: parsed.tail,
             approval: None,
+            finished: false,
             target: SessionTarget::Tmux {
                 pane_id: pane_id.to_string(),
                 agent_pid,

@@ -90,6 +90,7 @@ body {
 .pill-stat.run  { color: #8ab4ff; }
 .pill-stat.idle { color: #4cd97b; }
 .pill-stat.perm { color: #ffd166; }
+.pill-stat.done { color: #c6f7d6; font-weight: 700; }
 .pill-stat.run i { animation: pulse 1.2s ease-in-out infinite; }
 
 .pill-chevron {
@@ -430,6 +431,20 @@ body.killing-all .card {
 .card-idle {
   flex-shrink: 0;
   color: #4cd97b;
+}
+
+.card.finished {
+  border-color: rgba(76, 217, 123, 0.55);
+  background: rgba(24, 44, 34, 0.92);
+  box-shadow: 0 0 0 1px rgba(76, 217, 123, 0.15), 0 0 14px rgba(76, 217, 123, 0.12);
+}
+
+.card.finished:hover { background: rgba(30, 54, 41, 0.95); }
+
+.card-done {
+  flex-shrink: 0;
+  color: #4cd97b;
+  font-weight: 700;
 }
 
 .card-perm {
