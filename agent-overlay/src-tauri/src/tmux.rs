@@ -223,13 +223,7 @@ pub fn capture_pane(pane_id: &str, lines: u32) -> String {
     .unwrap_or_default()
 }
 
-/// Discover all agent sessions across every tmux session, classifying each
-/// as running/idle/permission using output markers plus change tracking.
-pub fn discover() -> Vec<AgentSession> {
-    discover_with_pane_pids().0
-}
-
-/// Like `discover`, but also returns the shell pid of *every* tmux pane
+/// Discover agent sessions and return the shell pid of *every* tmux pane
 /// (agent or not) so the process scanner can exclude tmux-rooted processes.
 pub fn discover_with_pane_pids() -> (Vec<AgentSession>, Vec<u32>) {
     let Some(out) = tmux(&[

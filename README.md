@@ -101,8 +101,8 @@ Status comes from three sources, most trusted first:
 
 | Status | How it is decided |
 |--------|-------------------|
-| `running` | Two consecutive polls with ≥ 80 ms CPU activity — one spike from a repaint or focus change is not enough. For Claude, also a session transcript touched within 120 s. |
-| `idle` | No active CPU sample for 10 s. The card shows how long. |
+| `running` | Claude reports `busy` in its per-process status file (`~/.claude/sessions/<pid>.json`). Other agents in tmux show a spinner or interrupt hint, or their pane output changed in the last 5 s. Other agents in plain terminals need two consecutive polls with ≥ 80 ms CPU activity, so one spike from a repaint or focus change is not enough. |
+| `idle` | Claude reports `idle`, or no activity signal for 10 s. The card shows how long. |
 | `permission` | An approval hook event, or an approval prompt matched in the pane text (`Do you want…`, `(Y)es/(N)o`). Shown in **Needs Approval**. |
 
 Hook events override scraping while fresh. Sessions whose CLI has no hooks fall back to scraping automatically, so every agent works with zero setup.
@@ -147,13 +147,15 @@ Command hooks invoke the overlay binary (`agent-overlay --hook-event running`) r
 | Action | How |
 |--------|-----|
 | Toggle overlay | `Ctrl+Shift+Space` |
-| Move window | Drag the titlebar |
+| Expand / collapse the panel | Click the pill; **─** collapses it |
+| Move window | Drag the pill's **⠿** grip, or the panel's titlebar |
 | Refresh sessions | Click **⟳** |
 | Focus a session | Double-click its card |
-| Kill a session | Click **✕** on the card |
+| Close a session's terminal tab | Click **✕** on the card |
+| Close every session | Click **✕ ALL** |
 | Mute status sounds | Click the speaker |
 | Settings | Click the gear |
-| Hide overlay | Click **─** |
+| Hide overlay | `Ctrl+Shift+Space`, or click the tray icon |
 
 ### Wayland
 
@@ -187,7 +189,7 @@ agent-overlay/
 - [x] Windows support
 - [x] Hooks that install themselves
 - [ ] Desktop notification when a session goes idle
-- [ ] Per-session output tail in the HUD
+- [x] Per-session output tail in the HUD (tmux sessions)
 - [ ] Configurable agent list and shortcuts
 
 ## Contributing
@@ -196,4 +198,4 @@ Issues and pull requests are welcome. `cargo test --lib` in `agent-overlay/src-t
 
 ## License
 
-Not yet licensed — until a licence file is added, default copyright applies and the code is not free to reuse. Opening an issue is the fastest way to get that fixed.
+[MIT](LICENSE).

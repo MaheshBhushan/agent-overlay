@@ -17,6 +17,10 @@ const post = (status: "running" | "idle" | "permission") => {
       // No tmux on Windows: pane is empty there and cwd is the only key.
       pane: proc?.env?.TMUX_PANE ?? "",
       cwd: proc?.cwd?.() ?? "",
+      // The plugin runs inside this OpenCode session. Outside tmux its PID is
+      // the per-tab identity used by the overlay's process scanner; cwd is
+      // shared by perfectly valid sibling tabs and cannot identify a session.
+      pids: proc?.pid ? [proc.pid] : [],
     }),
     signal: AbortSignal.timeout(2000),
   }).catch(() => {})
@@ -24,9 +28,11 @@ const post = (status: "running" | "idle" | "permission") => {
 
 export const AgentOverlay = async () => ({
   "tool.execute.before": async () => post("running"),
-  "permission.ask": async () => post("permission"),
-  event: async ({ event }: { event: { type: string } }) => {
+  event: async ({ event }: { event: { type: string; properties?: any } }) => {
+    if (event.type === "permission.asked") post("permission")
     if (event.type === "session.idle") post("idle")
-    if (event.type === "message.updated") post("running")
+    if (event.type === "session.status") {
+      post(event.properties?.status?.type === "idle" ? "idle" : "running")
+    }
   },
 })
