@@ -130,7 +130,7 @@ An event is filed against whatever names **one** session — the tmux pane id, o
 
 | CLI | Installed into | Approval signal |
 |-----|----------------|-----------------|
-| Claude Code | `~/.claude/settings.json` (merged) | `Notification`; `PreToolUse` and `Stop` clear it once answered |
+| Claude Code | `~/.claude/settings.json` (merged) | `PermissionRequest` and `Notification`; `PreToolUse` and `Stop` clear it once answered |
 | Codex CLI | `~/.codex/hooks/hooks.json` (merged) | `permission_request` — exact |
 | opencode | `~/.config/opencode/plugin/agent-overlay.ts` | `permission.ask` — exact |
 | pi | `~/.pi/agent/extensions/agent-overlay.ts` | none — pi exposes no approval event, so approvals stay scraped |
@@ -142,6 +142,14 @@ Command hooks invoke the overlay binary (`agent-overlay --hook-event running`) r
 > [!NOTE]
 > Codex's hook event names and file layout were read off the shipped binary (0.144), not published docs. If a future codex renames them the hooks stop firing and that CLI degrades to scraping.
 
+### Answering approvals from the overlay
+
+Claude Code sessions in Needs Approval show the tool and what it will touch (the command for `Bash`, the path for file tools), with **Approve** and **Deny** buttons. This works for sessions in tmux and in plain terminals.
+
+Claude's `PermissionRequest` hook runs `agent-overlay --hook-permission`. The hook posts the request to `POST /permission` and holds the connection open until you click. Claude shows its own approval dialog at the same time, and whichever answers first wins. Answering in the terminal stays possible. The session's next hook event then removes the buttons from the card. With no overlay running, the hook exits at once and prints nothing. The overlay gives up on an unanswered request after 9½ minutes, and the hook's own timeout is 10 minutes. Requests carrying `Origin` or `Referer` are answered without a decision, so a web page cannot approve anything.
+
+Other agents still show approvals without buttons; answer those in their terminal.
+
 ## Controls
 
 | Action | How |
@@ -151,6 +159,7 @@ Command hooks invoke the overlay binary (`agent-overlay --hook-event running`) r
 | Move window | Drag the pill's **⠿** grip, or the panel's titlebar |
 | Refresh sessions | Click **⟳** |
 | Focus a session | Double-click its card |
+| Answer a Claude Code approval | Click **Approve** or **Deny** on its card |
 | Close a session's terminal tab | Click **✕** on the card |
 | Close every session | Click **✕ ALL** |
 | Mute status sounds | Click the speaker |
@@ -186,6 +195,7 @@ agent-overlay/
 
 - [x] tmux and plain-terminal session discovery
 - [x] Needs Approval column, with push-based hook events and a scraping fallback
+- [x] Answer Claude Code approvals from the overlay
 - [x] Windows support
 - [x] Hooks that install themselves
 - [ ] Desktop notification when a session goes idle

@@ -445,6 +445,7 @@ pub fn discover(tmux_pane_pids: &[u32]) -> Vec<AgentSession> {
             status,
             idle_secs,
             tail: Vec::new(),
+            approval: None,
             target: SessionTarget::Process {
                 pid: *pid,
                 start_time,

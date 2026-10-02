@@ -117,6 +117,10 @@ pub fn discover_sessions() -> Vec<tmux::AgentSession> {
             }
             s.status = status;
         }
+        s.approval = hooks::approval_for(&s.pane_id, &s.cwd, s.target.start_time());
+        if s.approval.is_some() {
+            s.status = "permission".into();
+        }
     }
     assign_session_ids(&mut sessions);
     sessions
@@ -161,6 +165,13 @@ fn kill_session(session_id: String) -> Result<(), String> {
 #[tauri::command]
 fn launch_session(agent: String, cwd: String) -> Result<String, String> {
     tmux::launch(&agent, &cwd)
+}
+
+/// Answer an approval shown on a card. The request id is as opaque as a
+/// session id, and the hook that raised it is the only thing it reaches.
+#[tauri::command]
+fn answer_approval(request_id: String, allow: bool) -> Result<(), String> {
+    hooks::answer(&request_id, allow)
 }
 
 /// Bring the terminal hosting this session to the foreground.
@@ -272,6 +283,16 @@ fn run_cli() -> bool {
             let mut payload = String::new();
             let _ = std::io::stdin().read_to_string(&mut payload);
             hooks::post_notification(&payload);
+            true
+        }
+        Some("--hook-permission") => {
+            use std::io::Read;
+            let mut payload = String::new();
+            let _ = std::io::stdin().read_to_string(&mut payload);
+            // Printing nothing leaves the decision to Claude's own dialog.
+            if let Some(out) = hooks::request_permission(&payload) {
+                println!("{out}");
+            }
             true
         }
         Some("--install-hooks") => {
@@ -447,7 +468,8 @@ pub fn run() {
             toggle_overlay,
             play_sound,
             hook_status,
-            install_hooks
+            install_hooks,
+            answer_approval
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -469,6 +491,7 @@ mod tests {
             status: "idle".into(),
             idle_secs: Some(0),
             tail: Vec::new(),
+            approval: None,
             target,
         }
     }
