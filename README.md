@@ -103,6 +103,7 @@ Status comes from three sources, most trusted first:
 |--------|-------------------|
 | `running` | Claude reports `busy` in its per-process status file (`~/.claude/sessions/<pid>.json`). Other agents in tmux show a spinner or interrupt hint, or their pane output changed in the last 5 s. Other agents in plain terminals need two consecutive polls with ≥ 80 ms CPU activity, so one spike from a repaint or focus change is not enough. |
 | `idle` | Claude reports `idle`, or no activity signal for 10 s. The card shows how long. |
+| finished | A session that went from `running` or `permission` to `idle` after at least 3 s of work. Its card is highlighted and sorts to the top of **Idle**, and the pill shows a **✓** count. The flag stays until you double-click the card to focus the session, click the card once, or the session starts working again. |
 | `permission` | An approval hook event, or an approval prompt matched in the pane text (`Do you want…`, `(Y)es/(N)o`). Shown in **Needs Approval**. |
 
 Hook events override scraping while fresh. Sessions whose CLI has no hooks fall back to scraping automatically, so every agent works with zero setup.
@@ -160,6 +161,7 @@ Other agents still show approvals without buttons; answer those in their termina
 | Refresh sessions | Click **⟳** |
 | Focus a session | Double-click its card |
 | Answer a Claude Code approval | Click **Approve** or **Deny** on its card |
+| Mark a finished session as seen | Click its card |
 | Close a session's terminal tab | Click **✕** on the card |
 | Close every session | Click **✕ ALL** |
 | Mute status sounds | Click the speaker |
@@ -198,6 +200,7 @@ agent-overlay/
 - [x] Answer Claude Code approvals from the overlay
 - [x] Windows support
 - [x] Hooks that install themselves
+- [x] Highlight sessions that finished and haven't been looked at
 - [ ] Desktop notification when a session goes idle
 - [x] Per-session output tail in the HUD (tmux sessions)
 - [ ] Configurable agent list and shortcuts

@@ -1,3 +1,4 @@
+mod attention;
 mod claude_status;
 mod focus;
 mod hookinstall;
@@ -123,6 +124,7 @@ pub fn discover_sessions() -> Vec<tmux::AgentSession> {
         }
     }
     assign_session_ids(&mut sessions);
+    attention::update(&mut sessions);
     sessions
 }
 
@@ -182,7 +184,15 @@ fn focus_session(session_id: String) -> Result<(), String> {
         forget_session(&session_id);
         return Err(format!("session {session_id} has ended"));
     }
-    focus::focus(&target.handle())
+    focus::focus(&target.handle())?;
+    attention::mark_seen(&session_id);
+    Ok(())
+}
+
+/// The user has seen this session's finished work (they clicked its card).
+#[tauri::command]
+fn mark_seen(session_id: String) {
+    attention::mark_seen(&session_id);
 }
 
 #[tauri::command]
@@ -469,7 +479,8 @@ pub fn run() {
             play_sound,
             hook_status,
             install_hooks,
-            answer_approval
+            answer_approval,
+            mark_seen
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -492,6 +503,7 @@ mod tests {
             idle_secs: Some(0),
             tail: Vec::new(),
             approval: None,
+            finished: false,
             target,
         }
     }
