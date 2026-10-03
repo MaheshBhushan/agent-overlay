@@ -235,12 +235,14 @@ function patchColumn(container: HTMLElement, list: AgentSession[]) {
 function answerApproval(button: HTMLElement, allow: boolean) {
   const requestId = button.dataset.request;
   const box = button.closest(".approval");
+  // Codex's answer is typed into the pane of the card that was clicked.
+  const sessionId = (button.closest(".card") as HTMLElement | null)?.dataset.session ?? "";
   if (!requestId || !box) return;
   const buttons = Array.from(box.querySelectorAll("button"));
   const error = box.querySelector(".approval-error") as HTMLElement;
   buttons.forEach((b) => (b.disabled = true));
   error.textContent = allow ? "approving…" : "denying…";
-  invoke("answer_approval", { requestId, allow }).catch((err) => {
+  invoke("answer_approval", { requestId, sessionId, allow }).catch((err) => {
     // Most often it was answered in the terminal a moment earlier, and the
     // next refresh removes the buttons anyway.
     error.textContent = String(err);

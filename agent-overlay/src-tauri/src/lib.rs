@@ -94,7 +94,7 @@ pub fn discover_sessions() -> Vec<tmux::AgentSession> {
     let (mut sessions, pane_pids) = tmux::discover_with_pane_pids();
     sessions.extend(procscan::discover(&pane_pids));
     for s in &mut sessions {
-        if let Some(status) = hooks::override_for(&s.pane_id, &s.cwd, s.target.start_time()) {
+        if let Some(status) = hooks::override_for(&s.pane_id, &s.cwd, &s.agent, s.target.start_time()) {
             // Note this discards the *value* only. hooks::record has already
             // overwritten the map entry by the time we get here, which is what
             // ends a sticky approval — see hookinstall::claude_wanted. Skipping
@@ -118,7 +118,9 @@ pub fn discover_sessions() -> Vec<tmux::AgentSession> {
             }
             s.status = status;
         }
-        s.approval = hooks::approval_for(&s.pane_id, &s.cwd, s.target.start_time());
+        let in_tmux = matches!(s.target, SessionTarget::Tmux { .. });
+        s.approval =
+            hooks::approval_for(&s.pane_id, &s.cwd, &s.agent, s.target.start_time(), in_tmux);
         if s.approval.is_some() {
             s.status = "permission".into();
         }
@@ -170,10 +172,15 @@ fn launch_session(agent: String, cwd: String) -> Result<String, String> {
 }
 
 /// Answer an approval shown on a card. The request id is as opaque as a
-/// session id, and the hook that raised it is the only thing it reaches.
+/// session id, and the hook that raised it is the only thing it reaches —
+/// or, for Codex, the prompt in the tmux pane of the card that was clicked.
 #[tauri::command]
-fn answer_approval(request_id: String, allow: bool) -> Result<(), String> {
-    hooks::answer(&request_id, allow)
+fn answer_approval(request_id: String, session_id: String, allow: bool) -> Result<(), String> {
+    let pane = session_target(&session_id).ok().and_then(|target| match target {
+        SessionTarget::Tmux { pane_id, .. } if target.identity_matches() => Some(pane_id),
+        _ => None,
+    });
+    hooks::answer(&request_id, pane.as_deref(), allow)
 }
 
 /// Bring the terminal hosting this session to the foreground.
@@ -303,6 +310,14 @@ fn run_cli() -> bool {
             if let Some(out) = hooks::request_permission(&payload) {
                 println!("{out}");
             }
+            true
+        }
+        Some("--hook-codex-permission") => {
+            use std::io::Read;
+            let mut payload = String::new();
+            let _ = std::io::stdin().read_to_string(&mut payload);
+            // Returns at once: codex shows its prompt only after this exits.
+            hooks::report_codex_permission(&payload);
             true
         }
         Some("--install-hooks") => {

@@ -52,6 +52,10 @@ struct HookEvent {
     /// lands the event on one session instead of every session in a folder.
     #[serde(default)]
     pids: Vec<u32>,
+    /// The reporting agent ("codex", …), when the hook could tell. Scopes the
+    /// `cwd` fallback key to sessions of that agent.
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 struct Entry {
@@ -74,7 +78,7 @@ type Key = (String, Option<u64>);
 /// used only when nothing precise is available. Writing it alongside a precise
 /// key is what used to put an idle sibling in the Needs Approval column next
 /// to the session actually waiting.
-fn event_keys(pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) -> Vec<Key> {
+fn event_keys(pane: Option<&str>, cwd: Option<&str>, pids: &[u32], agent: Option<&str>) -> Vec<Key> {
     let pane = pane.filter(|p| !p.is_empty()).map(str::to_string);
     let live_pids: Vec<(u32, u64)> = pids
         .iter()
@@ -88,9 +92,24 @@ fn event_keys(pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) -> Vec<Key> {
             .map(|(pid, start)| (format!("pid:{pid}"), Some(start))),
     );
     if let Some(cwd) = cwd.filter(|c| !c.is_empty() && !precise) {
-        keys.push((format!("cwd:{cwd}"), None));
+        keys.push((cwd_key(cwd, agent), None));
     }
     keys
+}
+
+/// The folder key. With the agent named, only that agent's sessions in the
+/// folder match it: a codex approval must not land on a claude session that
+/// happens to work in the same directory.
+fn cwd_key(cwd: &str, agent: Option<&str>) -> String {
+    match agent.filter(|a| !a.is_empty()) {
+        Some(agent) => format!("cwd:{agent}:{cwd}"),
+        None => format!("cwd:{cwd}"),
+    }
+}
+
+/// The keys a session is looked up by, most precise first.
+fn lookup_keys(pane_id: &str, cwd: &str, agent: &str) -> [String; 3] {
+    [pane_id.to_string(), cwd_key(cwd, Some(agent)), cwd_key(cwd, None)]
 }
 
 /// The keys that name the reporting session itself, for matching one hook
@@ -102,8 +121,8 @@ fn event_keys(pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) -> Vec<Key> {
 /// terminal emulator's pid, so the tab that keeps working would cancel the
 /// approval pending in the other one. Only the pane and the agent's own pid
 /// identify a session.
-fn session_keys(pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) -> Vec<Key> {
-    only_agent_pid(event_keys(pane, cwd, pids), agent_pid(pids))
+fn session_keys(pane: Option<&str>, cwd: Option<&str>, pids: &[u32], agent: Option<&str>) -> Vec<Key> {
+    only_agent_pid(event_keys(pane, cwd, pids, agent), agent_pid(pids))
 }
 
 /// Drop every pid key but the agent's. With no agent among the pids (an agent
@@ -123,12 +142,9 @@ fn only_agent_pid(keys: Vec<Key>, agent: Option<u32>) -> Vec<Key> {
 /// procscan matches a session's own process.
 #[cfg(target_os = "linux")]
 fn agent_pid(pids: &[u32]) -> Option<u32> {
-    pids.iter().copied().find(|pid| {
-        std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| {
-            let args = String::from_utf8_lossy(&raw).replace('\0', " ");
-            crate::tmux::agent_from_args(&args).is_some()
-        })
-    })
+    pids.iter()
+        .copied()
+        .find(|pid| cmdline(*pid).is_some_and(|args| crate::tmux::agent_from_args(&args).is_some()))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -136,7 +152,12 @@ fn agent_pid(_pids: &[u32]) -> Option<u32> {
     None
 }
 
+#[cfg(test)]
 fn record(status: &str, pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) {
+    record_as(status, pane, cwd, pids, None);
+}
+
+fn record_as(status: &str, pane: Option<&str>, cwd: Option<&str>, pids: &[u32], agent: Option<&str>) {
     if !matches!(status, "running" | "idle" | "permission") {
         return;
     }
@@ -145,9 +166,9 @@ fn record(status: &str, pane: Option<&str>, cwd: Option<&str>, pids: &[u32]) {
     // the overlay's copy so the card loses its buttons. A permission event is
     // the same request announced again by `Notification`, so it keeps it.
     if status != "permission" {
-        cancel_pending(&session_keys(pane, cwd, pids));
+        cancel_pending(&session_keys(pane, cwd, pids, agent));
     }
-    record_keys(status, event_keys(pane, cwd, pids));
+    record_keys(status, event_keys(pane, cwd, pids, agent));
 }
 
 fn record_keys(status: &str, keys: Vec<Key>) {
@@ -167,11 +188,11 @@ fn record_keys(status: &str, keys: Vec<Key>) {
 }
 
 /// Fresh hook-reported status for a session, if any. Pane id wins over cwd.
-pub fn override_for(pane_id: &str, cwd: &str, start_time: u64) -> Option<String> {
+pub fn override_for(pane_id: &str, cwd: &str, agent: &str, start_time: u64) -> Option<String> {
     let guard = STATE.lock().unwrap();
     let map = guard.as_ref()?;
     let now = Instant::now();
-    for key in [pane_id.to_string(), format!("cwd:{cwd}")] {
+    for key in lookup_keys(pane_id, cwd, agent) {
         if let Some(e) = map.get(&key) {
             if e.start_time.is_some_and(|recorded| recorded != start_time) {
                 continue;
@@ -197,6 +218,15 @@ pub fn override_for(pane_id: &str, cwd: &str, start_time: u64) -> Option<String>
 // Approve / Deny, and the user's click travels back down that connection as
 // the hook's decision. Answering in the terminal instead is always possible.
 // The session's next running/idle event then retires the request here.
+//
+// opencode's TUI plugin (hooks/opencode-tui.ts) holds a request open the same
+// way and passes the answer to opencode's own permission API.
+//
+// Codex is the exception. It shows its prompt only once the hook has
+// returned, so a hook that waited for the overlay would freeze the terminal.
+// `--hook-codex-permission` reports the request and returns at once, and the
+// answer is typed into Codex's prompt in the session's tmux pane — see
+// [`Reply::Keys`].
 
 /// An approval the overlay can answer, as shown on the session's card.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -209,7 +239,25 @@ pub struct Approval {
 struct Pending {
     approval: Approval,
     keys: Vec<Key>,
-    tx: mpsc::Sender<Decision>,
+    reply: Reply,
+}
+
+/// How the user's answer reaches the agent.
+enum Reply {
+    /// A hook holding its connection open for the decision.
+    Hook(mpsc::Sender<Decision>),
+    /// Codex's prompt, on screen once its hook has returned. The answer is
+    /// typed into the pane of the card the user clicked, so only sessions in
+    /// tmux get buttons. Nothing holds a connection, so the request also
+    /// expires on its own.
+    Keys { since: Instant },
+}
+
+impl Pending {
+    fn expired(&self, now: Instant) -> bool {
+        matches!(&self.reply, Reply::Keys { since, .. }
+            if now.duration_since(*since).as_secs() >= PERMISSION_TTL_SECS)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -239,16 +287,15 @@ fn cancel_in(pending: &mut Vec<Pending>, keys: &[Key]) {
     }
     pending.retain(|p| {
         let stale = keys_overlap(&p.keys, keys);
-        if stale {
-            let _ = p.tx.send(Decision::Pass);
+        if let (true, Reply::Hook(tx)) = (stale, &p.reply) {
+            let _ = tx.send(Decision::Pass);
         }
         !stale
     });
 }
 
-fn add_pending(tool: String, summary: String, keys: Vec<Key>) -> (String, mpsc::Receiver<Decision>) {
+fn add_pending(tool: String, summary: String, keys: Vec<Key>, reply: Reply) -> String {
     let request_id = format!("AP-{}", NEXT_APPROVAL.fetch_add(1, Ordering::Relaxed));
-    let (tx, rx) = mpsc::channel();
     // A new request from a session supersedes any older one: Claude has moved
     // past the dialog that one belonged to. One lock for both steps, so no
     // refresh in between sees the session with no request at all.
@@ -261,9 +308,9 @@ fn add_pending(tool: String, summary: String, keys: Vec<Key>) -> (String, mpsc::
             summary,
         },
         keys,
-        tx,
+        reply,
     });
-    (request_id, rx)
+    request_id
 }
 
 fn remove_pending(request_id: &str) {
@@ -274,13 +321,23 @@ fn remove_pending(request_id: &str) {
 }
 
 /// The approval waiting on this session, if the overlay can answer it.
-/// Looked up the same way as [`override_for`].
-pub fn approval_for(pane_id: &str, cwd: &str, start_time: u64) -> Option<Approval> {
-    let pending = PENDING.lock().unwrap();
-    let wanted = [pane_id.to_string(), format!("cwd:{cwd}")];
+/// Looked up the same way as [`override_for`]. A Codex request can only be
+/// answered in tmux.
+pub fn approval_for(
+    pane_id: &str,
+    cwd: &str,
+    agent: &str,
+    start_time: u64,
+    in_tmux: bool,
+) -> Option<Approval> {
+    let mut pending = PENDING.lock().unwrap();
+    let now = Instant::now();
+    pending.retain(|p| !p.expired(now));
+    let wanted = lookup_keys(pane_id, cwd, agent);
     pending
         .iter()
         .rev()
+        .filter(|p| in_tmux || matches!(p.reply, Reply::Hook(_)))
         .find(|p| {
             p.keys.iter().any(|(key, recorded)| {
                 wanted.contains(key) && recorded.is_none_or(|r| r == start_time)
@@ -289,8 +346,9 @@ pub fn approval_for(pane_id: &str, cwd: &str, start_time: u64) -> Option<Approva
         .map(|p| p.approval.clone())
 }
 
-/// Send the user's answer to the hook holding `request_id`.
-pub fn answer(request_id: &str, allow: bool) -> Result<(), String> {
+/// Send the user's answer to the hook holding `request_id`. `pane` is the
+/// tmux pane of the card that was clicked, where a Codex answer is typed.
+pub fn answer(request_id: &str, pane: Option<&str>, allow: bool) -> Result<(), String> {
     let pending = {
         let mut all = PENDING.lock().unwrap();
         let i = all
@@ -299,10 +357,15 @@ pub fn answer(request_id: &str, allow: bool) -> Result<(), String> {
             .ok_or_else(|| format!("approval {request_id} was already answered"))?;
         all.remove(i)
     };
-    pending
-        .tx
-        .send(if allow { Decision::Allow } else { Decision::Deny })
-        .map_err(|_| format!("approval {request_id} was already answered"))?;
+    match &pending.reply {
+        Reply::Hook(tx) => tx
+            .send(if allow { Decision::Allow } else { Decision::Deny })
+            .map_err(|_| format!("approval {request_id} was already answered"))?,
+        Reply::Keys { .. } => {
+            let pane = pane.ok_or("this session isn't in tmux; answer it in its terminal")?;
+            answer_codex_prompt(pane, &pending.approval.summary, allow)?
+        }
+    }
     // Nothing else reports that the dialog closed: the next hook is the
     // following tool's PreToolUse or the turn's Stop. Leave the card in Needs
     // Approval until then and it looks as if the click did nothing.
@@ -320,6 +383,12 @@ struct PermissionRequest {
     tool: String,
     #[serde(default)]
     summary: String,
+    /// `"keys"`: the hook has already returned, and the answer is typed into
+    /// the agent's prompt (Codex). Absent: the hook waits for the decision.
+    #[serde(default)]
+    reply: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
 }
 
 /// Has the hook on the other end hung up? Claude may kill it once the
@@ -343,8 +412,11 @@ fn peer_closed(stream: &TcpStream) -> bool {
 fn await_decision(stream: &TcpStream, req: PermissionRequest) -> Decision {
     let pane = req.pane.as_deref();
     let cwd = req.cwd.as_deref();
-    record("permission", pane, cwd, &req.pids);
-    let (request_id, rx) = add_pending(req.tool, req.summary, session_keys(pane, cwd, &req.pids));
+    let agent = req.agent.as_deref();
+    record_as("permission", pane, cwd, &req.pids, agent);
+    let (tx, rx) = mpsc::channel();
+    let keys = session_keys(pane, cwd, &req.pids, agent);
+    let request_id = add_pending(req.tool, req.summary, keys, Reply::Hook(tx));
     let deadline = Instant::now() + Duration::from_secs(APPROVAL_WAIT_SECS);
     let decision = loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
@@ -361,17 +433,128 @@ fn await_decision(stream: &TcpStream, req: PermissionRequest) -> Decision {
     decision
 }
 
+/// File a request whose hook has already returned (Codex). The card gets
+/// buttons only in tmux, the one place the overlay can type the answer.
+fn register_keys_request(req: PermissionRequest) {
+    let pane = req.pane.as_deref();
+    let cwd = req.cwd.as_deref();
+    let agent = req.agent.as_deref();
+    record_as("permission", pane, cwd, &req.pids, agent);
+    let keys = session_keys(pane, cwd, &req.pids, agent);
+    if !keys.is_empty() {
+        add_pending(req.tool, req.summary, keys, Reply::Keys { since: Instant::now() });
+    }
+}
+
+/// Type the user's answer into Codex's approval prompt.
+///
+/// Refuses unless the prompt for this very request is on screen. Keys sent
+/// anywhere else would land in the composer or in another prompt, and a
+/// stray `y` must never approve a different command.
+fn answer_codex_prompt(pane: &str, summary: &str, allow: bool) -> Result<(), String> {
+    let screen = crate::tmux::capture_pane(pane, 0);
+    if !codex_prompt_shows(&screen, summary) {
+        return Err("Codex isn't showing this approval any more; answer it in the terminal".into());
+    }
+    if allow {
+        crate::tmux::send_keys(pane, "y", false)
+    } else {
+        crate::tmux::send_key(pane, "Escape")
+    }
+}
+
+/// Is Codex's approval prompt on `screen`, and is it about `summary`?
+///
+/// Codex wraps the command to the pane, so compare with whitespace folded,
+/// and only a prefix: a long command is cut short on screen.
+fn codex_prompt_shows(screen: &str, summary: &str) -> bool {
+    let fold = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let screen = fold(screen);
+    let summary = fold(summary);
+    let prefix: String = summary.chars().take(24).collect();
+    screen.contains("Yes, proceed") && screen.contains(&prefix)
+}
+
 /// The `--hook-permission` path: Claude Code's `PermissionRequest` hook.
 /// Returns what the hook should print on stdout, or `None` to print nothing
 /// and leave the decision to Claude's own dialog. With no overlay running it
 /// returns `None` at once.
 pub fn request_permission(payload: &str) -> Option<String> {
+    let wait = Duration::from_secs(APPROVAL_WAIT_SECS + 10);
+    send_permission(PORT, &permission_body(payload, &reporter()), wait)
+}
+
+/// The `--hook-codex-permission` path. Codex waits for its hooks before it
+/// shows the prompt, so this reports the request and returns without waiting
+/// for an answer.
+pub fn report_codex_permission(payload: &str) {
+    let body = keys_body(&permission_body(payload, &reporter()));
+    send_permission(PORT, &body, Duration::from_secs(2));
+}
+
+/// Who a hook is reporting for: the session's tmux pane and pids, and its
+/// agent when one of the pids is an agent CLI.
+#[derive(Default)]
+struct Reporter {
+    pane: String,
+    pids: Vec<u32>,
+    agent: Option<String>,
+}
+
+/// Work out the reporter from this hook process's environment and ancestry.
+///
+/// Codex 0.160+ runs every session's hooks inside one shared `codex
+/// app-server`. A hook there inherits the server's environment, whose
+/// TMUX_PANE is whichever terminal happened to start the server, possibly a
+/// pane long since closed and reused, and its pids are the server's. Both
+/// would file the event on the wrong card, so a hook under a shared server
+/// reports only its folder and agent.
+fn reporter() -> Reporter {
+    let pids = ancestor_pids();
     let pane = std::env::var("TMUX_PANE").unwrap_or_default();
-    send_permission(PORT, &permission_body(payload, &pane, &ancestor_pids()))
+    for pid in &pids {
+        let Some(args) = cmdline(*pid) else { continue };
+        if let Some(agent) = crate::tmux::shared_server(&args) {
+            return Reporter {
+                agent: Some(agent.to_string()),
+                ..Reporter::default()
+            };
+        }
+        if let Some(agent) = crate::tmux::agent_from_args(&args) {
+            return Reporter {
+                pane,
+                pids,
+                agent: Some(agent),
+            };
+        }
+    }
+    Reporter {
+        pane,
+        pids,
+        agent: None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cmdline(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(String::from_utf8_lossy(&raw).replace('\0', " "))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cmdline(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Mark a `POST /permission` body as answered by typing into the prompt.
+fn keys_body(body: &str) -> String {
+    let mut body: Value = serde_json::from_str(body).unwrap_or_default();
+    body["reply"] = Value::from("keys");
+    body.to_string()
 }
 
 /// The `POST /permission` body for the hook payload Claude wrote on stdin.
-fn permission_body(payload: &str, pane: &str, pids: &[u32]) -> String {
+fn permission_body(payload: &str, who: &Reporter) -> String {
     let input: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
     let tool = input
         .get("tool_name")
@@ -386,9 +569,10 @@ fn permission_body(payload: &str, pane: &str, pids: &[u32]) -> String {
         .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
         .unwrap_or_default();
     serde_json::json!({
-        "pane": pane,
+        "pane": who.pane,
         "cwd": cwd,
-        "pids": pids,
+        "pids": who.pids,
+        "agent": who.agent,
         "tool": tool,
         "summary": summary,
     })
@@ -397,11 +581,11 @@ fn permission_body(payload: &str, pane: &str, pids: &[u32]) -> String {
 
 /// Post a permission request and wait for the overlay's answer. Returns the
 /// hook's stdout for a decision, or `None` for none.
-fn send_permission(port: u16, body: &str) -> Option<String> {
+fn send_permission(port: u16, body: &str, wait: Duration) -> Option<String> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut c = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
     let _ = c.set_write_timeout(Some(Duration::from_secs(2)));
-    let _ = c.set_read_timeout(Some(Duration::from_secs(APPROVAL_WAIT_SECS + 10)));
+    let _ = c.set_read_timeout(Some(wait));
     c.write_all(
         format!(
             "POST /permission HTTP/1.1\r\nHost: localhost\r\n\
@@ -440,7 +624,17 @@ fn send_permission(port: u16, body: &str) -> Option<String> {
 /// One line saying what the tool wants to do: the command for Bash, the path
 /// for file tools, and the input itself for anything unrecognised.
 fn permission_summary(tool: &str, input: &Value) -> String {
-    let field = |name: &str| input.get(name).and_then(Value::as_str).map(str::to_string);
+    // Codex passes a command as argv rather than one string.
+    let field = |name: &str| match input.get(name)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(argv) => Some(
+            argv.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    };
     let text = match tool {
         "Bash" => field("command"),
         "Edit" | "MultiEdit" | "Write" | "Read" => field("file_path"),
@@ -516,15 +710,16 @@ fn ancestor_pids() -> Vec<u32> {
 }
 
 fn post_event_to(port: u16, status: &str) {
-    let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+    let who = reporter();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let body = serde_json::json!({
         "status": status,
-        "pane": pane,
+        "pane": who.pane,
         "cwd": cwd,
-        "pids": ancestor_pids(),
+        "pids": who.pids,
+        "agent": who.agent,
     })
     .to_string();
 
@@ -626,6 +821,10 @@ fn handle(stream: TcpStream, on_show: &dyn Fn()) -> Option<()> {
         // A web page must never get to approve anything; answer it "no
         // decision" without registering the request.
         let decision = match serde_json::from_slice::<PermissionRequest>(&body) {
+            Ok(req) if !from_browser && req.reply.as_deref() == Some("keys") => {
+                register_keys_request(req);
+                Decision::Pass
+            }
             Ok(req) if !from_browser => await_decision(&stream, req),
             _ => Decision::Pass,
         };
@@ -646,7 +845,13 @@ fn handle(stream: TcpStream, on_show: &dyn Fn()) -> Option<()> {
     }
     if path != "/show" && !from_browser {
         if let Ok(ev) = serde_json::from_slice::<HookEvent>(&body) {
-            record(&ev.status, ev.pane.as_deref(), ev.cwd.as_deref(), &ev.pids);
+            record_as(
+                &ev.status,
+                ev.pane.as_deref(),
+                ev.cwd.as_deref(),
+                &ev.pids,
+                ev.agent.as_deref(),
+            );
         }
     }
     // Answer before showing the window: the caller is waiting on this response
@@ -737,7 +942,7 @@ mod tests {
             .and_then(|pid| pid.parse().ok())
             .and_then(crate::procscan::process_start_time)
             .unwrap_or(0);
-        super::override_for(handle, cwd, start_time)
+        super::override_for(handle, cwd, "claude", start_time)
     }
 
     #[test]
@@ -796,11 +1001,11 @@ mod tests {
         record("permission", None, None, &[pid]);
 
         assert_eq!(
-            super::override_for(&format!("pid:{pid}"), "", start).as_deref(),
+            super::override_for(&format!("pid:{pid}"), "", "claude", start).as_deref(),
             Some("permission")
         );
         assert_eq!(
-            super::override_for(&format!("pid:{pid}"), "", start + 1),
+            super::override_for(&format!("pid:{pid}"), "", "claude", start + 1),
             None
         );
     }
@@ -1131,13 +1336,21 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         serve(listener, || {});
         let hook = std::thread::spawn(move || {
-            send_permission(port, &permission_body(payload, pane, &[]))
+            send_permission(port, &permission_body(payload, &in_pane(pane)), Duration::from_secs(5))
         });
         wait_until(
-            || approval_for(pane, "", 0).is_some(),
+            || approval_for(pane, "", "claude", 0, true).is_some(),
             "request never reached the overlay",
         );
         hook
+    }
+
+    /// A hook reporting from `pane`, agent unknown.
+    fn in_pane(pane: &str) -> Reporter {
+        Reporter {
+            pane: pane.to_string(),
+            ..Reporter::default()
+        }
     }
 
     const BASH_PAYLOAD: &str =
@@ -1146,28 +1359,28 @@ mod tests {
     #[test]
     fn an_approval_from_the_overlay_reaches_the_hook() {
         let hook = raise_request("%7101", BASH_PAYLOAD);
-        let approval = approval_for("%7101", "", 0).unwrap();
+        let approval = approval_for("%7101", "", "codex", 0, true).unwrap();
         assert_eq!(approval.tool, "Bash");
         assert_eq!(approval.summary, "npm test");
         assert_eq!(override_for("%7101", "").as_deref(), Some("permission"));
 
-        answer(&approval.request_id, true).unwrap();
+        answer(&approval.request_id, None, true).unwrap();
         let out: Value = serde_json::from_str(&hook.join().unwrap().unwrap()).unwrap();
         assert_eq!(out["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
         assert_eq!(out["hookSpecificOutput"]["decision"]["behavior"], "allow");
 
         // The card leaves Needs Approval at once instead of waiting for the
         // session's next hook.
-        assert_eq!(approval_for("%7101", "", 0), None);
+        assert_eq!(approval_for("%7101", "", "codex", 0, true), None);
         assert_eq!(override_for("%7101", "").as_deref(), Some("running"));
-        assert!(answer(&approval.request_id, true).is_err(), "answered twice");
+        assert!(answer(&approval.request_id, None, true).is_err(), "answered twice");
     }
 
     #[test]
     fn a_denial_from_the_overlay_reaches_the_hook() {
         let hook = raise_request("%7102", BASH_PAYLOAD);
-        let approval = approval_for("%7102", "", 0).unwrap();
-        answer(&approval.request_id, false).unwrap();
+        let approval = approval_for("%7102", "", "codex", 0, true).unwrap();
+        answer(&approval.request_id, None, false).unwrap();
         let out: Value = serde_json::from_str(&hook.join().unwrap().unwrap()).unwrap();
         let decision = &out["hookSpecificOutput"]["decision"];
         assert_eq!(decision["behavior"], "deny");
@@ -1181,22 +1394,22 @@ mod tests {
         let hook = raise_request("%7103", BASH_PAYLOAD);
         // Notification announces the same request again; that keeps it.
         record("permission", Some("%7103"), None, &[]);
-        assert!(approval_for("%7103", "", 0).is_some());
+        assert!(approval_for("%7103", "", "codex", 0, true).is_some());
 
         record("running", Some("%7103"), None, &[]);
         assert_eq!(hook.join().unwrap(), None);
-        assert_eq!(approval_for("%7103", "", 0), None);
+        assert_eq!(approval_for("%7103", "", "codex", 0, true), None);
     }
 
     #[test]
     fn a_new_request_supersedes_the_old_one() {
         let first = raise_request("%7104", BASH_PAYLOAD);
-        let old = approval_for("%7104", "", 0).unwrap();
+        let old = approval_for("%7104", "", "codex", 0, true).unwrap();
         let second = raise_request("%7104", BASH_PAYLOAD);
         assert_eq!(first.join().unwrap(), None, "the stale hook kept waiting");
-        let new = approval_for("%7104", "", 0).unwrap();
+        let new = approval_for("%7104", "", "codex", 0, true).unwrap();
         assert_ne!(old.request_id, new.request_id);
-        answer(&new.request_id, true).unwrap();
+        answer(&new.request_id, None, true).unwrap();
         assert!(second.join().unwrap().is_some());
     }
 
@@ -1204,10 +1417,10 @@ mod tests {
     #[test]
     fn a_request_belongs_to_its_own_session() {
         let hook = raise_request("%7105", BASH_PAYLOAD);
-        assert_eq!(approval_for("%7106", "/tmp/approval-test", 0), None);
+        assert_eq!(approval_for("%7106", "/tmp/approval-test", "codex", 0, true), None);
         record("running", Some("%7106"), None, &[]);
-        let approval = approval_for("%7105", "", 0).expect("a sibling cleared it");
-        answer(&approval.request_id, true).unwrap();
+        let approval = approval_for("%7105", "", "codex", 0, true).expect("a sibling cleared it");
+        answer(&approval.request_id, None, true).unwrap();
         hook.join().unwrap();
     }
 
@@ -1217,7 +1430,10 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
         let started = Instant::now();
-        assert_eq!(send_permission(port, &permission_body(BASH_PAYLOAD, "%7107", &[])), None);
+        assert_eq!(
+            send_permission(port, &permission_body(BASH_PAYLOAD, &in_pane("%7107")), Duration::from_secs(5)),
+            None
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -1226,7 +1442,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         serve(listener, || {});
-        let body = permission_body(BASH_PAYLOAD, "%7108", &[]);
+        let body = permission_body(BASH_PAYLOAD, &in_pane("%7108"));
         let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
         c.write_all(
             format!(
@@ -1240,7 +1456,7 @@ mod tests {
         let mut resp = String::new();
         c.read_to_string(&mut resp).unwrap();
         assert!(resp.ends_with("pass"), "{resp}");
-        assert_eq!(approval_for("%7108", "", 0), None);
+        assert_eq!(approval_for("%7108", "", "codex", 0, true), None);
     }
 
     /// Sibling tabs share the terminal emulator's pid. Only the agent's own
@@ -1275,6 +1491,97 @@ mod tests {
         let cut = permission_summary("Bash", &input(&long));
         assert_eq!(cut.chars().count(), 401);
         assert!(cut.ends_with('…'));
+    }
+
+    // ── codex: answered by typing into its prompt ──────────────────
+
+    /// Post a codex-style request the way `--hook-codex-permission` would.
+    fn raise_codex_request(pane: &str, payload: &str) -> Duration {
+        raise_codex_request_as(&in_pane(pane), payload)
+    }
+
+    fn raise_codex_request_as(who: &Reporter, payload: &str) -> Duration {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        serve(listener, || {});
+        let started = Instant::now();
+        let body = keys_body(&permission_body(payload, who));
+        assert_eq!(send_permission(port, &body, Duration::from_secs(2)), None);
+        started.elapsed()
+    }
+
+    /// Codex shows its prompt only after the hook exits, so the hook must not
+    /// wait for the user.
+    #[test]
+    fn a_codex_request_returns_at_once_with_buttons_in_tmux() {
+        let took = raise_codex_request("%7111", BASH_PAYLOAD);
+        assert!(took < Duration::from_secs(1), "the hook waited {took:?}");
+        let approval = approval_for("%7111", "", "codex", 0, true).expect("no buttons");
+        assert_eq!(approval.summary, "npm test");
+        assert_eq!(override_for("%7111", "").as_deref(), Some("permission"));
+
+        // Approving when that pane doesn't show this prompt is refused, not
+        // typed blind. (No tmux pane %7111 exists, so nothing shows it.)
+        let err = answer(&approval.request_id, Some("%7111"), true).unwrap_err();
+        assert!(err.contains("terminal"), "{err}");
+    }
+
+    /// Codex 0.160 runs hooks in a shared app-server, so the request names a
+    /// folder and an agent, not a pane. Every codex session in tmux in that
+    /// folder may answer it — the prompt check picks the right pane — but no
+    /// other agent's session there sees it, and outside tmux there is nowhere
+    /// to type the answer.
+    #[test]
+    fn a_request_from_a_shared_codex_server_reaches_codex_cards_only() {
+        let payload = r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"cwd":"/tmp/codex-shared"}"#;
+        let server = Reporter {
+            agent: Some("codex".into()),
+            ..Reporter::default()
+        };
+        raise_codex_request_as(&server, payload);
+        let dir = "/tmp/codex-shared";
+        assert!(approval_for("%7113", dir, "codex", 0, true).is_some());
+        assert_eq!(approval_for("pid:1", dir, "codex", 0, false), None, "not in tmux");
+        assert_eq!(approval_for("%7114", dir, "claude", 0, true), None, "another agent");
+        assert_eq!(super::override_for("%7114", dir, "claude", 0), None);
+        assert_eq!(
+            super::override_for("%7113", dir, "codex", 0).as_deref(),
+            Some("permission")
+        );
+        let approval = approval_for("%7113", dir, "codex", 0, true).unwrap();
+        let err = answer(&approval.request_id, None, true).unwrap_err();
+        assert!(err.contains("tmux"), "{err}");
+    }
+
+    #[test]
+    fn the_next_event_retires_a_codex_request() {
+        raise_codex_request("%7112", BASH_PAYLOAD);
+        assert!(approval_for("%7112", "", "codex", 0, true).is_some());
+        record("running", Some("%7112"), None, &[]);
+        assert_eq!(approval_for("%7112", "", "codex", 0, true), None);
+    }
+
+    #[test]
+    fn keys_go_only_to_the_prompt_for_this_request() {
+        let screen = "\
+  Would you like to run the following command?
+
+  $ npm run build -- --filter
+    web
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for this command (p)
+  3. No, and tell Codex what to do differently (esc)
+";
+        assert!(codex_prompt_shows(screen, "npm run build -- --filter web"));
+        assert!(!codex_prompt_shows(screen, "rm -rf target"), "another command");
+        assert!(!codex_prompt_shows("› npm run build", "npm run build"), "no prompt");
+    }
+
+    #[test]
+    fn an_argv_command_reads_as_one_line() {
+        let input: Value = serde_json::from_str(r#"{"command":["bash","-lc","ls"]}"#).unwrap();
+        assert_eq!(permission_summary("Bash", &input), "bash -lc ls");
     }
 
     fn wait_until(cond: impl Fn() -> bool, msg: &str) {
