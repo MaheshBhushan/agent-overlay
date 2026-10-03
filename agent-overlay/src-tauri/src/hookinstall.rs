@@ -207,6 +207,21 @@ fn entry_is_ours(v: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Take our hooks out of an event's array. A group of ours alone goes whole;
+/// a group we share with the user's hooks keeps theirs. Returns the index of
+/// the first group that held one of ours.
+fn strip_ours(arr: &mut Vec<Value>) -> Option<usize> {
+    let first = arr.iter().position(entry_is_ours);
+    arr.retain_mut(|e| {
+        let Some(hs) = e.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        hs.retain(|h| !h.get("command").and_then(Value::as_str).is_some_and(is_ours));
+        !hs.is_empty()
+    });
+    first
+}
+
 /// Merge `wanted` (event name → our entry) into the `hooks` object of a
 /// settings document, dropping any previous entries of ours. Returns whether
 /// the document changed, or an error naming the shape we refused to touch.
@@ -240,8 +255,7 @@ fn merge_hooks(
         // Replace ours where it stands rather than moving it to the end.
         // Codex trusts each hook by its position in the array, so moving ours
         // would shift the user's own hooks and send them back for review.
-        let at = arr.iter().position(entry_is_ours).unwrap_or(arr.len());
-        arr.retain(|e| !entry_is_ours(e));
+        let at = strip_ours(arr).unwrap_or(arr.len());
         arr.insert(at.min(arr.len()), ours.clone());
     }
     // Events we used to install into: drop our entries so an upgrade doesn't
@@ -256,7 +270,7 @@ fn merge_hooks(
         let Some(arr) = hooks.get_mut(*event).and_then(Value::as_array_mut) else {
             continue;
         };
-        arr.retain(|e| !entry_is_ours(e));
+        strip_ours(arr);
         if arr.is_empty() {
             hooks.remove(*event);
         }
@@ -466,7 +480,7 @@ fn retire_codex_legacy(path: &Path) -> Result<bool, String> {
     };
     let before = hooks.clone();
     for arr in hooks.values_mut().filter_map(Value::as_array_mut) {
-        arr.retain(|e| !entry_is_ours(e));
+        strip_ours(arr);
     }
     hooks.retain(|_, v| v.as_array().is_none_or(|a| !a.is_empty()));
     if *hooks == before {
@@ -1124,6 +1138,36 @@ mod tests {
         assert_eq!(ups.len(), 2);
         assert!(entry_is_ours(&ups[0]));
         assert_eq!(ups[1]["hooks"][0]["command"], json!("python3 recall.py"));
+    }
+
+    /// The user may list their own hook in the same group as ours. Replacing
+    /// ours must keep theirs.
+    #[test]
+    fn a_hook_sharing_our_group_survives() {
+        let dir = tmp("shared-group");
+        let path = dir.join("hooks.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[
+                 {"type":"command","command":"'/old/agent-overlay' --hook-event running"},
+                 {"type":"command","command":"python3 recall.py"}
+               ]}],
+               "user-prompt-submit":[{"hooks":[
+                 {"type":"command","command":"'/old/agent-overlay' --hook-event running"},
+                 {"type":"command","command":"python3 other.py"}
+               ]}]}}"#,
+        )
+        .unwrap();
+        install_json(&path, &codex_wanted().unwrap(), CODEX_RETIRED).unwrap();
+        let doc = read_json_object(&path).unwrap();
+        let ups = doc["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2);
+        assert!(entry_is_ours(&ups[0]));
+        assert_eq!(ups[1]["hooks"], json!([{"type":"command","command":"python3 recall.py"}]));
+        let retired = doc["hooks"]["user-prompt-submit"].as_array().unwrap();
+        assert_eq!(retired[0]["hooks"], json!([{"type":"command","command":"python3 other.py"}]));
+        // A second run finds everything current and leaves the file alone.
+        assert!(hooks_current(&doc, &codex_wanted().unwrap(), CODEX_RETIRED));
     }
 
     #[test]
