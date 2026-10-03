@@ -5,12 +5,12 @@
 //! scrape at all. Hooks are exact, so we install them for the user instead of
 //! asking them to hand-merge JSON:
 //!
-//! | CLI      | target                                       | approval signal        |
-//! |----------|----------------------------------------------|------------------------|
-//! | claude   | `~/.claude/settings.json` (merged)           | `PermissionRequest`    |
-//! | codex    | `~/.codex/hooks/hooks.json` (merged)         | `permission-request`   |
-//! | opencode | `~/.config/opencode/plugin/agent-overlay.ts` | `permission.ask`       |
-//! | pi       | `~/.pi/agent/extensions/agent-overlay.ts`    | none (scraped)         |
+//! | CLI      | target                                          | approval signal     |
+//! |----------|-------------------------------------------------|---------------------|
+//! | claude   | `~/.claude/settings.json` (merged)              | `PermissionRequest` |
+//! | codex    | `~/.codex/hooks.json` (merged)                  | `PermissionRequest` |
+//! | opencode | `~/.config/opencode/agent-overlay/tui.ts`, listed in `cli.json` | `permission.asked` |
+//! | pi       | `~/.pi/agent/extensions/agent-overlay.ts`       | none (scraped)      |
 //!
 //! Two properties matter more than anything else here, because this code edits
 //! files the user did not ask us to touch:
@@ -41,12 +41,15 @@ use std::path::{Path, PathBuf};
 /// 5: codex hook names use kebab-case, and `stop` reports idle immediately.
 /// 6: claude gets a `PermissionRequest` hook, so approvals can be answered
 /// from the overlay.
+/// 7: codex hooks move to `~/.codex/hooks.json` with PascalCase names, which
+/// is where codex reads them, and gain approvals; opencode gets a 2.x TUI
+/// plugin in place of the 1.x server plugin, which 2.x no longer loads.
 ///
 /// First run short-circuits on the stamp, so each of those needed a bump to
 /// reach anyone already set up.
-pub const HOOKS_VERSION: &str = "6";
+pub const HOOKS_VERSION: &str = "7";
 
-const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode-plugin.ts");
+const OPENCODE_TUI: &str = include_str!("../../hooks/opencode-tui.ts");
 const PI_EXTENSION: &str = include_str!("../../hooks/pi-extension.ts");
 
 /// What we found (and possibly did) for one CLI.
@@ -170,6 +173,7 @@ fn is_ours(cmd: &str) -> bool {
     cmd.contains("--hook-event")
         || cmd.contains("--hook-notify")
         || cmd.contains("--hook-permission")
+        || cmd.contains("--hook-codex-permission")
         || cmd.contains("127.0.0.1:8377")
 }
 
@@ -233,8 +237,12 @@ fn merge_hooks(
             .entry((*event).to_string())
             .or_insert_with(|| json!([]));
         let arr = arr.as_array_mut().expect("checked above");
+        // Replace ours where it stands rather than moving it to the end.
+        // Codex trusts each hook by its position in the array, so moving ours
+        // would shift the user's own hooks and send them back for review.
+        let at = arr.iter().position(entry_is_ours).unwrap_or(arr.len());
         arr.retain(|e| !entry_is_ours(e));
-        arr.push(ours.clone());
+        arr.insert(at.min(arr.len()), ours.clone());
     }
     // Events we used to install into: drop our entries so an upgrade doesn't
     // leave them behind, and take the key with them if nothing else is there.
@@ -395,36 +403,150 @@ fn claude_wanted() -> Result<Vec<(&'static str, Value)>, String> {
 /// the next install rather than left as litter in the user's settings.
 const CLAUDE_RETIRED: &[&str] = &["UserPromptSubmit"];
 
-fn codex_path() -> Option<PathBuf> {
-    Some(home()?.join(".codex").join("hooks").join("hooks.json"))
+/// `$CODEX_HOME`, which codex defaults to `~/.codex`.
+fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| Some(home()?.join(".codex")))
 }
 
-/// codex 0.144+ ships a Claude-shaped hooks system. `permission-request` is
-/// the exact approval signal, and `stop` reports the end of a turn.
+fn codex_path() -> Option<PathBuf> {
+    Some(codex_home()?.join("hooks.json"))
+}
+
+/// Where versions before 7 wrote codex hooks. Codex never read this file.
+fn codex_legacy_path() -> Option<PathBuf> {
+    Some(codex_home()?.join("hooks").join("hooks.json"))
+}
+
+/// codex ships a Claude-shaped hooks system, read from `$CODEX_HOME/hooks.json`
+/// with Claude's PascalCase event names.
 ///
-/// The event names and file layout are read off the shipped binary rather than
-/// public docs, so treat the schema as provisional: if a future codex renames
-/// these, the hooks simply never fire and the overlay degrades to scraping.
+/// Codex runs `PermissionRequest` hooks *before* it shows its prompt, so ours
+/// must return at once; see `--hook-codex-permission`. `PostToolUse` is what
+/// ends an approval answered in the terminal: nothing else fires between the
+/// approved tool and the next one.
+///
+/// Codex asks the user to review each new or changed hook before running it.
+/// That is codex's decision to make, so the review is left to them.
 fn codex_wanted() -> Result<Vec<(&'static str, Value)>, String> {
     Ok(vec![
-        ("user-prompt-submit", entry(event_command("running")?)),
-        ("pre-tool-use", entry(event_command("running")?)),
-        ("permission-request", entry(event_command("permission")?)),
-        ("stop", entry(event_command("idle")?)),
+        ("UserPromptSubmit", entry(event_command("running")?)),
+        ("PreToolUse", entry(event_command("running")?)),
+        (
+            "PermissionRequest",
+            entry(format!("{} --hook-codex-permission", quoted_exe()?)),
+        ),
+        ("PostToolUse", entry(event_command("running")?)),
+        ("Stop", entry(event_command("idle")?)),
     ])
 }
 
-/// Names installed before codex exposed the public kebab-case event names.
-const CODEX_RETIRED: &[&str] = &["user_prompt_submit", "pre_tool_use", "permission_request"];
+/// Names earlier versions wrote. Codex reads none of them.
+const CODEX_RETIRED: &[&str] = &[
+    "user_prompt_submit",
+    "pre_tool_use",
+    "permission_request",
+    "user-prompt-submit",
+    "pre-tool-use",
+    "permission-request",
+    "stop",
+];
+
+/// Take our entries out of the file earlier versions wrote by mistake.
+/// Returns whether anything changed. The file goes too once nothing is left.
+fn retire_codex_legacy(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut doc = read_json_object(path)?;
+    let Some(hooks) = doc.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return Ok(false);
+    };
+    let before = hooks.clone();
+    for arr in hooks.values_mut().filter_map(Value::as_array_mut) {
+        arr.retain(|e| !entry_is_ours(e));
+    }
+    hooks.retain(|_, v| v.as_array().is_none_or(|a| !a.is_empty()));
+    if *hooks == before {
+        return Ok(false);
+    }
+    if hooks.is_empty() && doc.len() == 1 {
+        std::fs::remove_file(path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+    } else {
+        write_json(path, &doc)?;
+    }
+    Ok(true)
+}
+
+fn codex_legacy_present(path: &Path) -> bool {
+    read_json_object(path).is_ok_and(|doc| {
+        doc.get("hooks")
+            .and_then(Value::as_object)
+            .is_some_and(|h| h.values().filter_map(Value::as_array).flatten().any(entry_is_ours))
+    })
+}
+
+/// opencode's config directory: `$XDG_CONFIG_HOME/opencode`, on every OS.
+fn opencode_dir() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|c| !c.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| Some(home()?.join(".config")))?;
+    Some(config.join("opencode"))
+}
+
+/// The plugin directory, and how `cli.json` names it. opencode 2.x loads a
+/// TUI plugin from a directory's `tui` module, resolved relative to cli.json.
+const OPENCODE_TUI_DIR: &str = "agent-overlay";
+const OPENCODE_CLI_ENTRY: &str = "./agent-overlay";
 
 fn opencode_path() -> Option<PathBuf> {
-    Some(
-        home()?
-            .join(".config")
-            .join("opencode")
-            .join("plugin")
-            .join("agent-overlay.ts"),
-    )
+    Some(opencode_dir()?.join(OPENCODE_TUI_DIR).join("tui.ts"))
+}
+
+/// Does cli.json load our plugin?
+fn opencode_listed(cli: &Path) -> bool {
+    read_json_object(cli).is_ok_and(|doc| {
+        doc.get("plugins")
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(|p| p.as_str() == Some(OPENCODE_CLI_ENTRY)))
+    })
+}
+
+/// Add our plugin to cli.json's `plugins`, keeping everything else.
+fn list_opencode_plugin(cli: &Path) -> Result<bool, String> {
+    if opencode_listed(cli) {
+        return Ok(false);
+    }
+    let mut doc = read_json_object(cli)?;
+    if doc.is_empty() {
+        doc.insert("$schema".into(), json!("https://opencode.ai/v2/cli.json"));
+    }
+    let plugins = doc.entry("plugins".to_string()).or_insert_with(|| json!([]));
+    let Some(plugins) = plugins.as_array_mut() else {
+        return Err(format!("`plugins` in {} is not an array; left untouched", cli.display()));
+    };
+    plugins.push(json!(OPENCODE_CLI_ENTRY));
+    write_json(cli, &doc)?;
+    Ok(true)
+}
+
+/// The 1.x server plugin earlier versions installed. opencode 2.x refuses to
+/// load it and reports a failed plugin on every start.
+fn opencode_legacy_path() -> Option<PathBuf> {
+    Some(opencode_dir()?.join("plugin").join("agent-overlay.ts"))
+}
+
+fn install_opencode(dir: &Path) -> Result<&'static str, String> {
+    let plugin = install_file(&dir.join(OPENCODE_TUI_DIR).join("tui.ts"), OPENCODE_TUI)?;
+    let listed = list_opencode_plugin(&dir.join("cli.json"))?;
+    let retired = retire_file(&dir.join("plugin").join("agent-overlay.ts"))?;
+    Ok(match plugin {
+        "unchanged" if listed || retired => "updated",
+        other => other,
+    })
 }
 
 fn pi_path() -> Option<PathBuf> {
@@ -469,6 +591,26 @@ fn file_state(path: &Path, payload: &str) -> (bool, bool) {
         }
         _ => (false, false),
     }
+}
+
+fn is_our_file(path: &Path) -> bool {
+    file_state(path, "\0").1
+}
+
+/// Remove a payload of ours we no longer ship, keeping it as the `.bak` if
+/// there isn't one yet. Someone else's file at that path is left alone.
+fn retire_file(path: &Path) -> Result<bool, String> {
+    if !is_our_file(path) {
+        return Ok(false);
+    }
+    let bak = path.with_extension("ts.agent-overlay.bak");
+    let gone = if bak.exists() {
+        std::fs::remove_file(path)
+    } else {
+        std::fs::rename(path, &bak)
+    };
+    gone.map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+    Ok(true)
 }
 
 fn install_file(path: &Path, payload: &str) -> Result<&'static str, String> {
@@ -556,7 +698,9 @@ pub fn status() -> Vec<CliHooks> {
         let path = codex_path();
         let wanted = codex_wanted();
         let note = match &wanted {
-            Ok(_) => "running, idle and approvals are reported by hooks".to_string(),
+            Ok(_) => "approvals can be answered from the overlay for codex in tmux; \
+                      codex asks you to review changed hooks once"
+                .to_string(),
             Err(e) => e.clone(),
         };
         // On a refusal there is nothing we could have installed — and an empty
@@ -567,13 +711,16 @@ pub fn status() -> Vec<CliHooks> {
             .as_deref()
             .and_then(|p| read_json_object(p).ok())
             .unwrap_or_default();
-        let installed = !refused && hooks_current(&doc, &wanted, CODEX_RETIRED);
+        let legacy = codex_legacy_path().is_some_and(|p| codex_legacy_present(&p));
+        let installed = !refused && !legacy && hooks_current(&doc, &wanted, CODEX_RETIRED);
         out.push(CliHooks {
             id: "codex",
             name: "OpenAI Codex CLI",
-            present: cli_present(home().map(|h| h.join(".codex")), "codex"),
+            present: cli_present(codex_home(), "codex"),
             installed,
-            outdated: !refused && !installed && hooks_present(&doc, &wanted, CODEX_RETIRED),
+            outdated: !refused
+                && !installed
+                && (legacy || hooks_present(&doc, &wanted, CODEX_RETIRED)),
             path: path.map(|p| p.display().to_string()).unwrap_or_default(),
             exact_approval: true,
             note,
@@ -583,22 +730,22 @@ pub fn status() -> Vec<CliHooks> {
     // opencode
     {
         let path = opencode_path();
-        let (installed, outdated) = path
+        let (current, ours) = path
             .as_deref()
-            .map(|p| file_state(p, OPENCODE_PLUGIN))
+            .map(|p| file_state(p, OPENCODE_TUI))
             .unwrap_or((false, false));
+        let listed = opencode_dir().is_some_and(|d| opencode_listed(&d.join("cli.json")));
+        let legacy = opencode_legacy_path().is_some_and(|p| is_our_file(&p));
+        let installed = current && listed && !legacy;
         out.push(CliHooks {
             id: "opencode",
             name: "opencode",
-            present: cli_present(
-                home().map(|h| h.join(".config").join("opencode")),
-                "opencode",
-            ),
+            present: cli_present(opencode_dir(), "opencode"),
             installed,
-            outdated,
+            outdated: !installed && (ours || current || legacy),
             path: path.map(|p| p.display().to_string()).unwrap_or_default(),
             exact_approval: true,
-            note: String::new(),
+            note: "needs opencode 2.x".into(),
         });
     }
 
@@ -638,12 +785,17 @@ pub fn install_all() -> Vec<InstallOutcome> {
                     Some(p) => claude_wanted().and_then(|w| install_json(&p, &w, CLAUDE_RETIRED)),
                     None => Err("no home directory".into()),
                 },
-                "codex" => match codex_path() {
-                    Some(p) => codex_wanted().and_then(|w| install_json(&p, &w, CODEX_RETIRED)),
-                    None => Err("no home directory".into()),
+                "codex" => match (codex_path(), codex_legacy_path()) {
+                    (Some(p), Some(legacy)) => codex_wanted()
+                        .and_then(|w| install_json(&p, &w, CODEX_RETIRED))
+                        .and_then(|action| {
+                            let retired = retire_codex_legacy(&legacy)?;
+                            Ok(if action == "unchanged" && retired { "updated" } else { action })
+                        }),
+                    _ => Err("no home directory".into()),
                 },
-                "opencode" => match opencode_path() {
-                    Some(p) => install_file(&p, OPENCODE_PLUGIN),
+                "opencode" => match opencode_dir() {
+                    Some(dir) => install_opencode(&dir),
                     None => Err("no home directory".into()),
                 },
                 "pi" => match pi_path() {
@@ -917,8 +1069,8 @@ mod tests {
     fn a_bad_later_event_refuses_the_whole_file() {
         let dir = tmp("partial");
         let path = dir.join("hooks.json");
-        // user-prompt-submit is merged before permission-request is reached.
-        let original = r#"{"hooks":{"user-prompt-submit":[],"permission-request":"nope"}}"#;
+        // UserPromptSubmit is merged before PermissionRequest is reached.
+        let original = r#"{"hooks":{"UserPromptSubmit":[],"PermissionRequest":"nope"}}"#;
         std::fs::write(&path, original).unwrap();
 
         assert!(install_json(&path, &codex_wanted().unwrap(), CODEX_RETIRED).is_err());
@@ -926,31 +1078,131 @@ mod tests {
     }
 
     #[test]
-    fn codex_hooks_use_public_event_names_and_retire_old_ones() {
+    fn codex_hooks_use_pascal_case_names_and_retire_old_ones() {
         let dir = tmp("codex-events");
         let path = dir.join("hooks.json");
         std::fs::write(
             &path,
-            r#"{"hooks":{"user_prompt_submit":[{"hooks":[{"type":"command","command":"agent-overlay --hook-event running"}]}]}}"#,
+            r#"{"hooks":{"user_prompt_submit":[{"hooks":[{"type":"command","command":"agent-overlay --hook-event running"}]}],
+                         "permission-request":[{"hooks":[{"type":"command","command":"agent-overlay --hook-event permission"}]}]}}"#,
         )
         .unwrap();
 
         install_json(&path, &codex_wanted().unwrap(), CODEX_RETIRED).unwrap();
         let doc = read_json_object(&path).unwrap();
         let hooks = doc["hooks"].as_object().unwrap();
-        for event in [
-            "user-prompt-submit",
-            "pre-tool-use",
-            "permission-request",
-            "stop",
-        ] {
-            assert!(hooks.contains_key(event), "missing {event}");
-        }
-        assert!(!hooks.contains_key("user_prompt_submit"));
-        assert!(hooks["stop"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .ends_with("--hook-event idle"));
+        let mut events: Vec<_> = hooks.keys().map(String::as_str).collect();
+        events.sort();
+        assert_eq!(
+            events,
+            ["PermissionRequest", "PostToolUse", "PreToolUse", "Stop", "UserPromptSubmit"]
+        );
+        let command = |event: &str| hooks[event][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+        assert!(command("Stop").ends_with("--hook-event idle"));
+        // Codex waits on this one before showing its prompt: it must be the
+        // variant that returns at once, not Claude's blocking one.
+        assert!(command("PermissionRequest").ends_with("--hook-codex-permission"));
+    }
+
+    /// Codex trusts a hook by its position in the event's array. Updating ours
+    /// must leave the user's hooks where they were.
+    #[test]
+    fn our_entry_is_replaced_in_place() {
+        let dir = tmp("in-place");
+        let path = dir.join("hooks.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"UserPromptSubmit":[
+                 {"hooks":[{"type":"command","command":"'/old/agent-overlay' --hook-event running"}]},
+                 {"hooks":[{"type":"command","command":"python3 recall.py"}]}
+               ]}}"#,
+        )
+        .unwrap();
+        install_json(&path, &codex_wanted().unwrap(), CODEX_RETIRED).unwrap();
+        let doc = read_json_object(&path).unwrap();
+        let ups = doc["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 2);
+        assert!(entry_is_ours(&ups[0]));
+        assert_eq!(ups[1]["hooks"][0]["command"], json!("python3 recall.py"));
+    }
+
+    #[test]
+    fn the_misplaced_codex_file_loses_our_hooks() {
+        let dir = tmp("codex-legacy");
+        let ours_only = dir.join("ours.json");
+        std::fs::write(
+            &ours_only,
+            r#"{"hooks":{"stop":[{"hooks":[{"type":"command","command":"x --hook-event idle"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(codex_legacy_present(&ours_only));
+        assert!(retire_codex_legacy(&ours_only).unwrap());
+        assert!(!ours_only.exists(), "a file left with nothing in it");
+
+        let shared = dir.join("shared.json");
+        std::fs::write(
+            &shared,
+            r#"{"hooks":{"stop":[{"hooks":[{"type":"command","command":"x --hook-event idle"}]},
+                                 {"hooks":[{"type":"command","command":"notify.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(retire_codex_legacy(&shared).unwrap());
+        let doc = read_json_object(&shared).unwrap();
+        assert_eq!(doc["hooks"]["stop"].as_array().unwrap().len(), 1);
+        assert!(!retire_codex_legacy(&shared).unwrap(), "second run changed it");
+        assert!(!retire_codex_legacy(&dir.join("missing.json")).unwrap());
+    }
+
+    #[test]
+    fn opencode_gets_a_tui_plugin_listed_in_cli_json() {
+        let dir = tmp("opencode");
+        let cli = dir.join("cli.json");
+        std::fs::write(&cli, r#"{"$schema":"x","plugins":["./herdr-tui-session.js"]}"#).unwrap();
+        let legacy = dir.join("plugin").join("agent-overlay.ts");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "// agent-overlay hooks v1\n").unwrap();
+
+        assert_eq!(install_opencode(&dir).unwrap(), "installed");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("agent-overlay").join("tui.ts")).unwrap(),
+            OPENCODE_TUI
+        );
+        let doc = read_json_object(&cli).unwrap();
+        assert_eq!(doc["plugins"], json!(["./herdr-tui-session.js", "./agent-overlay"]));
+        // The 1.x plugin that 2.x refuses to load is gone, kept as the backup.
+        assert!(!legacy.exists());
+        assert!(legacy.with_extension("ts.agent-overlay.bak").exists());
+
+        assert_eq!(install_opencode(&dir).unwrap(), "unchanged");
+        assert_eq!(read_json_object(&cli).unwrap()["plugins"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn opencode_without_cli_json_gets_one() {
+        let dir = tmp("opencode-fresh");
+        install_opencode(&dir).unwrap();
+        let doc = read_json_object(&dir.join("cli.json")).unwrap();
+        assert_eq!(doc["plugins"], json!(["./agent-overlay"]));
+    }
+
+    #[test]
+    fn a_cli_json_we_do_not_understand_is_left_alone() {
+        let dir = tmp("opencode-odd");
+        let original = r#"{"plugins":{"herdr":true}}"#;
+        std::fs::write(dir.join("cli.json"), original).unwrap();
+        assert!(install_opencode(&dir).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("cli.json")).unwrap(), original);
+    }
+
+    /// Someone else's file at the old plugin path is not ours to retire.
+    #[test]
+    fn a_foreign_legacy_plugin_is_kept() {
+        let dir = tmp("opencode-foreign-legacy");
+        let legacy = dir.join("plugin").join("agent-overlay.ts");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "export default {}\n").unwrap();
+        install_opencode(&dir).unwrap();
+        assert!(legacy.exists());
     }
 
     #[test]
@@ -1065,15 +1317,15 @@ mod tests {
     fn file_payload_install_and_state() {
         let dir = tmp("plugin");
         let path = dir.join("plugin").join("agent-overlay.ts");
-        assert_eq!(file_state(&path, OPENCODE_PLUGIN), (false, false));
-        assert_eq!(install_file(&path, OPENCODE_PLUGIN).unwrap(), "installed");
-        assert_eq!(file_state(&path, OPENCODE_PLUGIN), (true, false));
-        assert_eq!(install_file(&path, OPENCODE_PLUGIN).unwrap(), "unchanged");
+        assert_eq!(file_state(&path, OPENCODE_TUI), (false, false));
+        assert_eq!(install_file(&path, OPENCODE_TUI).unwrap(), "installed");
+        assert_eq!(file_state(&path, OPENCODE_TUI), (true, false));
+        assert_eq!(install_file(&path, OPENCODE_TUI).unwrap(), "unchanged");
 
         // An older version of ours reads as outdated, and gets refreshed.
         std::fs::write(&path, "// agent-overlay hooks v0\n").unwrap();
-        assert_eq!(file_state(&path, OPENCODE_PLUGIN), (false, true));
-        assert_eq!(install_file(&path, OPENCODE_PLUGIN).unwrap(), "updated");
+        assert_eq!(file_state(&path, OPENCODE_TUI), (false, true));
+        assert_eq!(install_file(&path, OPENCODE_TUI).unwrap(), "updated");
     }
 
     /// Same filename, someone else's file. We don't own it, so we don't get to
@@ -1086,7 +1338,7 @@ mod tests {
         let theirs = "export const mine = () => console.log('not ours')\n";
         std::fs::write(&path, theirs).unwrap();
 
-        assert!(install_file(&path, OPENCODE_PLUGIN).is_err());
+        assert!(install_file(&path, OPENCODE_TUI).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
     }
 
@@ -1100,13 +1352,13 @@ mod tests {
         let old = "// agent-overlay hooks v0\n";
         std::fs::write(&path, old).unwrap();
 
-        assert_eq!(install_file(&path, OPENCODE_PLUGIN).unwrap(), "updated");
+        assert_eq!(install_file(&path, OPENCODE_TUI).unwrap(), "updated");
         let bak = path.with_extension("ts.agent-overlay.bak");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), old);
 
         // A later upgrade must not overwrite the pristine backup.
         std::fs::write(&path, "// agent-overlay hooks v0.5\n").unwrap();
-        assert_eq!(install_file(&path, OPENCODE_PLUGIN).unwrap(), "updated");
+        assert_eq!(install_file(&path, OPENCODE_TUI).unwrap(), "updated");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), old);
     }
 

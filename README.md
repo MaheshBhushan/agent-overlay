@@ -118,7 +118,9 @@ It listens on `127.0.0.1:8377`:
 POST /event  {"status": "running|idle|permission", "pane": "%3", "cwd": "…", "pids": [123]}
 ```
 
-An event is filed against whatever names **one** session — the tmux pane id, or the reporting hook's ancestor pids, which is how a session outside tmux is identified. `cwd` is a last resort, used only when neither is available: two agents working in one folder is normal, and a key they share cannot mean "this one". Requests carrying `Origin` or `Referer` are ignored, so a web page cannot forge status.
+An event is filed against whatever names **one** session — the tmux pane id, or the reporting hook's ancestor pids, which is how a session outside tmux is identified. `cwd` is a last resort, used only when neither is available: two agents working in one folder is normal, and a key they share cannot mean "this one". An event that names its `agent` only reaches that agent's sessions through the `cwd` key. Requests carrying `Origin` or `Referer` are ignored, so a web page cannot forge status.
+
+Codex 0.160+ runs every session's hooks inside one shared `codex app-server`, and opencode 2.x runs server plugins in one shared background service. A hook there inherits the environment of whichever terminal started the server. So a hook running under `codex app-server` reports only its folder and agent, never the server's pane or pids, and opencode reports from a TUI plugin, which runs inside each tab. Neither server is listed as a session.
 
 `running`/`idle` override scraping for 2 minutes; `permission` stays sticky for 30 minutes or until the session's next event, whichever comes first.
 
@@ -132,8 +134,8 @@ An event is filed against whatever names **one** session — the tmux pane id, o
 | CLI | Installed into | Approval signal |
 |-----|----------------|-----------------|
 | Claude Code | `~/.claude/settings.json` (merged) | `PermissionRequest` and `Notification`; `PreToolUse` and `Stop` clear it once answered |
-| Codex CLI | `~/.codex/hooks/hooks.json` (merged) | `permission_request` — exact |
-| opencode | `~/.config/opencode/plugin/agent-overlay.ts` | `permission.ask` — exact |
+| Codex CLI | `$CODEX_HOME/hooks.json`, default `~/.codex/hooks.json` (merged) | `PermissionRequest`; `PostToolUse` and `Stop` clear it once answered |
+| opencode 2.x | `~/.config/opencode/agent-overlay/tui.ts`, listed in `cli.json` | `permission.asked`; `permission.replied` clears it |
 | pi | `~/.pi/agent/extensions/agent-overlay.ts` | none — pi exposes no approval event, so approvals stay scraped |
 
 Installation is idempotent and non-destructive. Only entries the overlay recognises as its own are ever replaced; everything else in those files is preserved verbatim; the original is copied to `<name>.agent-overlay.bak` before the first edit. A config it cannot parse, or a file already sitting at one of the plugin paths that it did not write, is reported and left alone. Uninstalling leaves the hooks in place — they are inert without the overlay running.
@@ -141,13 +143,25 @@ Installation is idempotent and non-destructive. Only entries the overlay recogni
 Command hooks invoke the overlay binary (`agent-overlay --hook-event running`) rather than `curl`, so one command works under both `sh` and `cmd.exe`. A hook never fails or blocks its agent: with no overlay running the connection times out silently.
 
 > [!NOTE]
-> Codex's hook event names and file layout were read off the shipped binary (0.144), not published docs. If a future codex renames them the hooks stop firing and that CLI degrades to scraping.
+> Codex asks you to review new or changed hooks once, at startup. Choose **Trust all and continue**; until then Codex doesn't run them and the overlay scrapes Codex panes as before. Versions before 7 wrote Codex hooks to `~/.codex/hooks/hooks.json`, which Codex never read; installing removes the overlay's entries from that file.
 
 ### Answering approvals from the overlay
 
-Claude Code sessions in Needs Approval show the tool and what it will touch (the command for `Bash`, the path for file tools), with **Approve** and **Deny** buttons. This works for sessions in tmux and in plain terminals.
+Sessions in Needs Approval show the tool and what it will touch (the command for `Bash`, the path for file tools), with **Approve** and **Deny** buttons:
+
+| CLI | Where the buttons work | How the answer arrives |
+|-----|------------------------|------------------------|
+| Claude Code | tmux and plain terminals | the `PermissionRequest` hook's decision |
+| opencode 2.x | tmux and plain terminals | opencode's permission API, called by the TUI plugin |
+| Codex CLI | tmux only | typed into Codex's own prompt |
+| pi | — | pi has no approvals of its own |
+
 
 Claude's `PermissionRequest` hook runs `agent-overlay --hook-permission`. The hook posts the request to `POST /permission` and holds the connection open until you click. Claude shows its own approval dialog at the same time, and whichever answers first wins. Answering in the terminal stays possible. The session's next hook event then removes the buttons from the card. With no overlay running, the hook exits at once and prints nothing. The overlay gives up on an unanswered request after 9½ minutes, and the hook's own timeout is 10 minutes. Requests carrying `Origin` or `Referer` are answered without a decision, so a web page cannot approve anything.
+
+opencode's TUI plugin does the same from inside each tab. On `permission.asked` for the session the tab shows (or one of its subagents), it posts the request and waits. An answer from the overlay goes to opencode's permission API, which closes opencode's own dialog. Answering in opencode instead cancels the overlay's request. The plugin runs in the tab's process, so its pane and pid name the right card.
+
+Codex is different: it runs `PermissionRequest` hooks *before* it shows its prompt, so a hook that waited for the overlay would freeze the terminal. `agent-overlay --hook-codex-permission` reports the request and returns at once. **Approve** then types `y` into the Codex prompt in the clicked card's tmux pane, and **Deny** types `Esc`. Before typing, the overlay checks that the pane shows Codex's approval prompt for this command. Otherwise it refuses and asks you to answer in the terminal, so a stray `y` never lands in the composer or approves a different command. Codex in a plain terminal shows the approval without buttons. Codex asks only when its `approval_policy` allows it to; with `never` there is nothing to answer.
 
 Other agents still show approvals without buttons; answer those in their terminal.
 
@@ -160,7 +174,7 @@ Other agents still show approvals without buttons; answer those in their termina
 | Move window | Drag the pill's **⠿** grip, or the panel's titlebar |
 | Refresh sessions | Click **⟳** |
 | Focus a session | Double-click its card |
-| Answer a Claude Code approval | Click **Approve** or **Deny** on its card |
+| Answer an approval (Claude Code, opencode, Codex in tmux) | Click **Approve** or **Deny** on its card |
 | Mark a finished session as seen | Click its card |
 | Close a session's terminal tab | Click **✕** on the card |
 | Close every session | Click **✕ ALL** |
@@ -197,7 +211,7 @@ agent-overlay/
 
 - [x] tmux and plain-terminal session discovery
 - [x] Needs Approval column, with push-based hook events and a scraping fallback
-- [x] Answer Claude Code approvals from the overlay
+- [x] Answer Claude Code, opencode and Codex approvals from the overlay
 - [x] Windows support
 - [x] Hooks that install themselves
 - [x] Highlight sessions that finished and haven't been looked at

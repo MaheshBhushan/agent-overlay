@@ -87,6 +87,24 @@ const AGENTS: &[(&str, &str)] = &[
     ("pycli", "pi"),
 ];
 
+/// A server that many sessions share, rather than a session: codex's
+/// `app-server` (codex 0.160+ runs every terminal's thread inside one) and
+/// opencode's `serve` (its background service). Neither is a card of its own,
+/// and a hook running inside one inherits the environment of whichever
+/// terminal started it. Returns the agent it serves.
+pub fn shared_server(args: &str) -> Option<&'static str> {
+    let lower = args.to_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().map(normalize_token).collect();
+    let has = |t: &str| tokens.contains(&t);
+    if has("codex") && has("app-server") {
+        Some("codex")
+    } else if has("opencode") && has("serve") {
+        Some("opencode")
+    } else {
+        None
+    }
+}
+
 /// Output stability window: if a pane's content changed within this many
 /// seconds it counts as running even without a recognized spinner marker.
 const ACTIVITY_WINDOW_SECS: u64 = 5;
@@ -167,6 +185,9 @@ fn normalize_token(tok: &str) -> &str {
 /// ("claude", "/usr/bin/claude", "node .../claude", "claude.cmd",
 /// "C:\\...\\claude.exe" etc.).
 pub fn agent_from_args(args: &str) -> Option<String> {
+    if shared_server(args).is_some() {
+        return None;
+    }
     let lower = args.to_lowercase();
     for (name, label) in AGENTS {
         if lower
@@ -340,6 +361,13 @@ pub fn send_keys(pane_id: &str, text: &str, enter: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Send one named key (`Escape`, `Enter`, …) to a pane.
+pub fn send_key(pane_id: &str, key: &str) -> Result<(), String> {
+    tmux(&["send-keys", "-t", pane_id, key])
+        .map(|_| ())
+        .ok_or_else(|| format!("send {key} to {pane_id} failed"))
+}
+
 pub fn kill_pane(pane_id: &str) -> Result<(), String> {
     tmux(&["kill-pane", "-t", pane_id]).ok_or_else(|| format!("kill-pane {pane_id} failed"))?;
     Ok(())
@@ -358,4 +386,27 @@ pub fn launch(agent: &str, cwd: &str) -> Result<String, String> {
     tmux(&["new-session", "-d", "-s", &name, "-c", cwd, agent])
         .ok_or_else(|| format!("failed to launch {agent} in {cwd}"))?;
     Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The servers agents share are not sessions, and a hook inside one must
+    /// not trust the terminal it inherited.
+    #[test]
+    fn shared_servers_are_not_sessions() {
+        let codex_server = "/home/u/.codex/packages/app-server-daemon/releases/0.160.0/bin/codex \
+                            app-server --listen unix:// --managed-daemon";
+        assert_eq!(shared_server(codex_server), Some("codex"));
+        assert_eq!(agent_from_args(codex_server), None);
+        assert_eq!(shared_server("/home/u/.opencode/bin/opencode serve --service"), Some("opencode"));
+        assert_eq!(agent_from_args("opencode serve --stdio --port 0"), None);
+
+        assert_eq!(shared_server("codex"), None);
+        assert_eq!(agent_from_args("codex").as_deref(), Some("codex"));
+        assert_eq!(agent_from_args("opencode -s ses_1").as_deref(), Some("opencode"));
+        // A session merely working on something called "serve" is still one.
+        assert_eq!(agent_from_args("claude serve").as_deref(), Some("claude"));
+    }
 }
