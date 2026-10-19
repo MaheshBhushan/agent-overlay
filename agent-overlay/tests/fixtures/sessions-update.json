@@ -1,0 +1,239 @@
+{
+  "initial": [
+    {
+      "session_id": "AO-01",
+      "pane_id": "%1",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-1",
+      "status": "running",
+      "idle_secs": null,
+      "tail": [
+        "Working"
+      ],
+      "approval": null,
+      "finished": false
+    },
+    {
+      "session_id": "AO-02",
+      "pane_id": "%2",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-2",
+      "status": "idle",
+      "idle_secs": 10,
+      "tail": [
+        "Working"
+      ],
+      "approval": null,
+      "finished": true
+    },
+    {
+      "session_id": "AO-03",
+      "pane_id": "%3",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-3",
+      "status": "permission",
+      "idle_secs": 4,
+      "tail": [
+        "Working"
+      ],
+      "approval": {
+        "request_id": "request-1",
+        "tool": "shell",
+        "summary": "npm test"
+      },
+      "finished": false
+    }
+  ],
+  "tick": [
+    {
+      "session_id": "AO-01",
+      "pane_id": "%1",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-1",
+      "status": "running",
+      "idle_secs": 1,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": null,
+      "finished": false
+    },
+    {
+      "session_id": "AO-02",
+      "pane_id": "%2",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-2",
+      "status": "idle",
+      "idle_secs": 11,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": null,
+      "finished": true
+    },
+    {
+      "session_id": "AO-03",
+      "pane_id": "%3",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-3",
+      "status": "permission",
+      "idle_secs": 5,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": {
+        "request_id": "request-1",
+        "tool": "shell",
+        "summary": "npm test"
+      },
+      "finished": false
+    }
+  ],
+  "moved": [
+    {
+      "session_id": "AO-03",
+      "pane_id": "%3",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-3",
+      "status": "running",
+      "idle_secs": 5,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": {
+        "request_id": "request-1",
+        "tool": "shell",
+        "summary": "npm test"
+      },
+      "finished": false
+    },
+    {
+      "session_id": "AO-02",
+      "pane_id": "%2",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-2",
+      "status": "idle",
+      "idle_secs": 11,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": null,
+      "finished": true
+    },
+    {
+      "session_id": "AO-01",
+      "pane_id": "%1",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-1",
+      "status": "idle",
+      "idle_secs": 0,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": null,
+      "finished": true
+    }
+  ],
+  "replaced": [
+    {
+      "session_id": "AO-01",
+      "pane_id": "%1",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-1",
+      "status": "running",
+      "idle_secs": 1,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": null,
+      "finished": false
+    },
+    {
+      "session_id": "AO-02",
+      "pane_id": "%2",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-2",
+      "status": "idle",
+      "idle_secs": 11,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": null,
+      "finished": true
+    },
+    {
+      "session_id": "AO-03",
+      "pane_id": "%3",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-3",
+      "status": "permission",
+      "idle_secs": 5,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": {
+        "request_id": "request-2",
+        "tool": "shell",
+        "summary": "npm run build"
+      },
+      "finished": false
+    }
+  ],
+  "removed": [
+    {
+      "session_id": "AO-01",
+      "pane_id": "%1",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-1",
+      "status": "running",
+      "idle_secs": 1,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": null,
+      "finished": false
+    },
+    {
+      "session_id": "AO-02",
+      "pane_id": "%2",
+      "session_name": "work",
+      "window_index": "0",
+      "agent": "codex",
+      "cwd": "/work/project-2",
+      "status": "idle",
+      "idle_secs": 11,
+      "tail": [
+        "Updated output"
+      ],
+      "approval": null,
+      "finished": true
+    }
+  ],
+  "empty": []
+}

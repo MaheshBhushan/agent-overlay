@@ -170,17 +170,23 @@ Other agents still show approvals without buttons; answer those in their termina
 | Action | How |
 |--------|-----|
 | Toggle overlay | `Ctrl+Shift+Space` |
-| Expand / collapse the panel | Click the pill; **─** collapses it |
+| Expand / collapse the panel | Click the pill or focus it and press `Enter` / `Space`; **─** collapses it |
+| Navigate cards and controls | `Tab` / `Shift+Tab`; on a card, `↑` / `↓` move between cards and `Home` / `End` jump to the first / last card |
 | Move window | Drag the pill's **⠿** grip, or the panel's titlebar |
 | Refresh sessions | Click **⟳** |
-| Focus a session | Double-click its card |
-| Answer an approval (Claude Code, opencode, Codex in tmux) | Click **Approve** or **Deny** on its card |
-| Mark a finished session as seen | Click its card |
-| Close a session's terminal tab | Click **✕** on the card |
+| Focus a session | Double-click its card or press `Enter` on the focused card |
+| Answer an approval (Claude Code, opencode, Codex in tmux) | Click **Approve** / **Deny**, or focus the button and press `Enter` / `Space` |
+| Mark a finished session as seen | Click its card or press `Space` on the focused card |
+| Close a session's terminal tab | Click **✕**, or focus it and press `Enter` / `Space`; confirm the dialog |
 | Close every session | Click **✕ ALL** |
 | Mute status sounds | Click the speaker |
 | Settings | Click the gear |
 | Hide overlay | `Ctrl+Shift+Space`, or click the tray icon |
+
+Refreshes keep keyboard focus on the same session and action across status changes
+and reordering. A changed approval request returns focus to its card. Removing a
+focused session moves focus to the next card, the previous card at the end of the
+board, or **Refresh** when the board is empty. Collapsing returns focus to the pill.
 
 ### Wayland
 
@@ -222,6 +228,21 @@ agent-overlay/
 ## Contributing
 
 Issues and pull requests are welcome. `cargo test --lib` in `agent-overlay/src-tauri/` runs the suite; the parser, process scanning, hook listener and hook installer are all covered.
+
+The TypeScript keyboard regression suite runs in Chromium against the real frontend.
+It replays `sessions-update` fixtures through Tauri's mocked event API and checks
+Tab order, activation, pending controls, and focus retention. All native commands
+use mocked IPC, so tests cannot operate real sessions.
+
+```sh
+cd agent-overlay
+npm ci
+npx playwright install chromium
+npm run test:keyboard
+npm run build
+```
+
+The Windows build workflow runs the keyboard suite before packaging the app.
 
 ## License
 

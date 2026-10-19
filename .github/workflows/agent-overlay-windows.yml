@@ -38,6 +38,12 @@ jobs:
       - name: Install frontend deps
         run: npm install
 
+      - name: Install keyboard test browser
+        run: npx playwright install chromium
+
+      - name: Keyboard navigation regressions
+        run: npm run test:keyboard
+
       - name: Tauri build
         id: build
         shell: bash

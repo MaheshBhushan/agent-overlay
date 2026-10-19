@@ -10,7 +10,7 @@
   <body>
     <div id="hud">
       <!-- Collapsed pill: always visible, top-center. Hover / click to expand. -->
-      <div id="pill" title="Click to expand · drag the grip to move">
+      <div id="pill" role="button" tabindex="0" aria-label="Toggle session panel" aria-expanded="false" aria-controls="panel" title="Click to expand · drag the grip to move">
         <span class="pill-grip" data-tauri-drag-region title="Drag to move">⠿</span>
         <span class="pill-logo">⌬</span>
         <span class="pill-stat run"><i>●</i><b id="pill-running">0</b></span>
@@ -27,10 +27,10 @@
         <span class="spacer" data-tauri-drag-region></span>
         <span class="hint" data-tauri-drag-region>Ctrl+Shift+Space to toggle</span>
         <button id="btn-kill-all" class="danger" title="Close all agent sessions" disabled>✕ ALL</button>
-        <button id="btn-sound" title="Mute sounds">🔊</button>
-        <button id="btn-settings" title="Settings">⚙</button>
-        <button id="btn-refresh" title="Refresh sessions">⟳</button>
-        <button id="btn-minimize" title="Collapse">─</button>
+        <button id="btn-sound" aria-label="Toggle sounds" title="Mute sounds">🔊</button>
+        <button id="btn-settings" aria-label="Settings" title="Settings">⚙</button>
+        <button id="btn-refresh" aria-label="Refresh sessions" title="Refresh sessions">⟳</button>
+        <button id="btn-minimize" aria-label="Collapse session panel" title="Collapse">─</button>
       </header>
 
       <div id="settings" class="hidden">

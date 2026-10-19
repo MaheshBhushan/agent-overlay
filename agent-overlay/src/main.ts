@@ -143,7 +143,7 @@ function headHtml(s: AgentSession): string {
       <span class="session-id" title="Overlay session ID · ${esc(s.pane_id)}">${esc(s.session_id)}</span>
       <span class="project" title="${esc(s.cwd)}">${esc(projectName(s.cwd))}</span>
       ${srcTag}
-      <button class="kill" data-session="${esc(s.session_id)}" title="Close terminal tab">✕</button>`;
+      <button class="kill" data-session="${esc(s.session_id)}" aria-label="Close terminal tab for ${esc(s.session_id)}" title="Close terminal tab">✕</button>`;
 }
 
 function bodyHtml(s: AgentSession): string {
@@ -199,25 +199,21 @@ function setHtml(el: Element, html: string) {
 /// click whose press and release straddle a refresh, break double-click, and
 /// flicker tooltips. Each card has three parts patched separately: the idle
 /// timer ticks every second, and that must not touch the buttons.
-function patchColumn(container: HTMLElement, list: AgentSession[]) {
-  const existing = new Map<string, HTMLElement>();
-  for (const el of Array.from(container.children) as HTMLElement[]) {
-    existing.set(el.dataset.session ?? "", el);
-  }
-  const wanted = new Set(list.map((s) => s.session_id));
-  for (const [id, el] of existing) {
-    if (!wanted.has(id)) el.remove();
-  }
+function patchColumn(container: HTMLElement, list: AgentSession[], existing: Map<string, HTMLElement>) {
   list.forEach((s, i) => {
     let card = existing.get(s.session_id);
     if (!card) {
       card = document.createElement("div");
       card.className = "card";
       card.dataset.session = s.session_id;
-      card.title = "Double-click to open terminal";
+      card.tabIndex = 0;
+      card.setAttribute("role", "group");
+      card.setAttribute("aria-keyshortcuts", "Enter Space ArrowUp ArrowDown Home End");
+      card.title = "Enter or double-click to open terminal · Space to mark seen";
       card.innerHTML =
         `<div class="card-head"></div><div class="card-body"></div><div class="card-actions"></div>`;
     }
+    card.setAttribute("aria-label", `${s.session_id} · ${projectName(s.cwd)} · ${s.finished ? "finished" : s.status}`);
     card.classList.toggle("finished", s.finished);
     const [head, body, actions] = Array.from(card.children);
     setHtml(head, headHtml(s));
@@ -240,7 +236,9 @@ function answerApproval(button: HTMLElement, allow: boolean) {
   if (!requestId || !box) return;
   const buttons = Array.from(box.querySelectorAll("button"));
   const error = box.querySelector(".approval-error") as HTMLElement;
+  const hadFocus = box.contains(document.activeElement);
   buttons.forEach((b) => (b.disabled = true));
+  if (hadFocus) button.closest<HTMLElement>(".card")?.focus({ preventScroll: true });
   error.textContent = allow ? "approving…" : "denying…";
   invoke("answer_approval", { requestId, sessionId, allow }).catch((err) => {
     // Most often it was answered in the terminal a moment earlier, and the
@@ -263,6 +261,14 @@ function render() {
   const badge      = $("#status-badge");
   const empty      = $("#empty");
   const board      = $("#board");
+  const focused = document.activeElement as HTMLElement | null;
+  const focusedCard = focused?.closest<HTMLElement>(".card");
+  const focusedAction = focused?.matches(".approve") ? ".approve"
+    : focused?.matches(".deny") ? ".deny" : focused?.matches(".kill") ? ".kill" : null;
+  const focusedRequest = focused?.dataset.request;
+  const cards = Array.from(board.querySelectorAll<HTMLElement>(".card"));
+  const focusIndex = focusedCard ? cards.indexOf(focusedCard) : -1;
+  const existing = new Map(cards.map(card => [card.dataset.session!, card]));
 
   const running = sessions.filter(s => s.status === "running");
   // Finished-and-unseen first, most recent at the top: those are the idle
@@ -277,9 +283,25 @@ function render() {
   empty.classList.toggle("hidden", sessions.length > 0);
   board.classList.toggle("hidden", sessions.length === 0);
 
-  patchColumn($("#cards-running"), running);
-  patchColumn($("#cards-idle"), idle);
-  patchColumn($("#cards-permission"), perms);
+  const wanted = new Set([...running, ...idle, ...perms].map(s => s.session_id));
+  for (const [id, card] of existing) {
+    if (!wanted.has(id)) card.remove();
+  }
+  patchColumn($("#cards-running"), running, existing);
+  patchColumn($("#cards-idle"), idle, existing);
+  patchColumn($("#cards-permission"), perms, existing);
+
+  // Moving a node with insertBefore drops browser focus. Restore the exact
+  // control only while it still exists; a new approval must get a new choice.
+  if (focusedCard && document.activeElement !== focused) {
+    const remaining = Array.from(board.querySelectorAll<HTMLElement>(".card"));
+    const replacement = focusedAction ? focusedCard.querySelector<HTMLButtonElement>(focusedAction) : null;
+    const target = focused?.isConnected && !focused.matches(":disabled") ? focused
+      : replacement?.isConnected && !replacement.disabled && replacement.dataset.request === focusedRequest ? replacement
+      : focusedCard.isConnected ? focusedCard
+      : remaining[Math.min(focusIndex, remaining.length - 1)] ?? $("#btn-refresh");
+    target.focus({ preventScroll: true });
+  }
 
   $("#count-running").textContent    = String(running.length);
   $("#count-idle").textContent       = String(idle.length);
@@ -358,7 +380,16 @@ async function setExpanded(on: boolean) {
   if (expanded === on) return;
   expanded = on;
   document.body.classList.toggle("expanded", on);
+  $("#pill").setAttribute("aria-expanded", String(on));
+  if (!on && $("#panel").contains(document.activeElement)) $("#pill").focus();
   await applySize();
+}
+
+function focusSession(sessionId: string) {
+  clearTimeout(seenTimer);
+  invoke("focus_session", { sessionId })
+    .then(() => markSeen(sessionId))
+    .catch((err) => alert(`Could not open terminal: ${err}`));
 }
 
 // Resize the window to whatever the current state calls for, holding its
@@ -516,6 +547,38 @@ window.addEventListener("DOMContentLoaded", async () => {
     if ((e.target as HTMLElement).closest(".pill-grip")) return;
     setExpanded(!expanded);
   });
+  pill.addEventListener("keydown", (e) => {
+    if ((e.key === "Enter" || e.key === " ") && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      if (!e.repeat) void setExpanded(!expanded);
+    }
+  });
+
+  $("#board").addEventListener("keydown", (e) => {
+    const card = (e.target as HTMLElement).closest<HTMLElement>(".card");
+    // Native buttons own Enter/Space; card shortcuts must never activate them.
+    if (!card || e.target !== card || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+    const cards = Array.from($("#board").querySelectorAll<HTMLElement>(".card"));
+    const index = cards.indexOf(card);
+    let next: HTMLElement | undefined;
+    switch (e.key) {
+      case "ArrowUp": next = cards[Math.max(0, index - 1)]; break;
+      case "ArrowDown": next = cards[Math.min(cards.length - 1, index + 1)]; break;
+      case "Home": next = cards[0]; break;
+      case "End": next = cards[cards.length - 1]; break;
+      case "Enter":
+        e.preventDefault();
+        if (!e.repeat) focusSession(card.dataset.session!);
+        return;
+      case " ":
+        e.preventDefault();
+        if (!e.repeat && card.classList.contains("finished")) markSeen(card.dataset.session!);
+        return;
+      default: return;
+    }
+    e.preventDefault();
+    next?.focus();
+  });
 
   await listen<AgentSession[]>("sessions-update", (event) => {
     updateSessions(event.payload);
@@ -547,6 +610,8 @@ window.addEventListener("DOMContentLoaded", async () => {
         // animation that ends in a real unmount, never a resting width:0 state.
         const card = el.closest(".card") as HTMLElement | null;
         card?.classList.add("exiting");
+        (el as HTMLButtonElement).disabled = true;
+        if (document.activeElement === el) card?.focus({ preventScroll: true });
         invoke("kill_session", { sessionId })
           .then(() => {
             // Process is confirmed gone (backend waits for /proc to clear).
@@ -555,6 +620,7 @@ window.addEventListener("DOMContentLoaded", async () => {
           })
           .catch((err) => {
             card?.classList.remove("exiting");
+            (el as HTMLButtonElement).disabled = false;
             alert(`Could not kill session: ${err}`);
           });
       }
@@ -564,12 +630,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.body.addEventListener("dblclick", (e) => {
     const card = (e.target as HTMLElement).closest(".card") as HTMLElement | null;
     if (!card?.dataset.session || (e.target as HTMLElement).closest("button, .approval")) return;
-    clearTimeout(seenTimer);
-    const sessionId = card.dataset.session;
-    invoke("focus_session", { sessionId })
-      // The backend marks a focused session seen; show it without waiting.
-      .then(() => markSeen(sessionId))
-      .catch((err) => alert(`Could not open terminal: ${err}`));
+    focusSession(card.dataset.session);
   });
 
   // ─ collapses the panel back to the pill.
